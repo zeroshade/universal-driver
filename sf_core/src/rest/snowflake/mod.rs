@@ -19,7 +19,7 @@ use reqwest::{self, header};
 use serde_json;
 use snafu::{Location, ResultExt, Snafu};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing;
 use url::Url;
 
@@ -223,17 +223,63 @@ pub async fn snowflake_query_with_client(
     retry_policy: &RetryPolicy,
     execution_mode: QueryExecutionMode,
 ) -> Result<query_response::Response, RestError> {
+    // Try async mode if requested
+    let mut retried_612 = false;
     if matches!(execution_mode, QueryExecutionMode::Async) {
-        return snowflake_query_async_style(
+        match snowflake_query_async_style(
             client,
             &query_parameters,
-            session_token,
-            sql,
-            parameter_bindings,
+            session_token.clone(),
+            sql.clone(),
+            parameter_bindings.clone(),
             retry_policy,
         )
-        .await;
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(RestError::AsyncQuery {
+                source:
+                    SfError::AsyncPollResultNotFound {
+                        is_first_poll: true,
+                        ..
+                    },
+                ..
+            }) => {
+                // Error 612 "Result not found" on first poll - safe to retry with sync.
+                // We'll log after sync completes based on actual command type.
+                retried_612 = true;
+            }
+            Err(RestError::AsyncQuery {
+                source:
+                    SfError::AsyncPollResultNotFound {
+                        is_first_poll: false,
+                        ..
+                    },
+                ..
+            }) => {
+                // Got 612 after successful polls - something went wrong, don't retry
+                tracing::error!(
+                    sql_prefix = sql.chars().take(50).collect::<String>(),
+                    "Error 612 after prior successful polls; not retrying"
+                );
+                return Err(RestError::AsyncQuery {
+                    source: SfError::AsyncPollResultNotFound {
+                        is_first_poll: false,
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    },
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
+
+    // Save prefix for logging if we retried due to 612
+    let sql_prefix = if retried_612 {
+        Some(sql.chars().take(50).collect::<String>())
+    } else {
+        None
+    };
 
     let query_request = query_request::Request {
         sql_text: sql,
@@ -282,6 +328,7 @@ pub async fn snowflake_query_with_client(
     // tracing::debug!("Request accept: {:?}", request.accept());
     // tracing::debug!("Request accept-encoding: {:?}", request.accept_encoding());
 
+    let send_start = Instant::now();
     let response = client.execute(request).await.context(CommunicationSnafu {
         context: "Failed to execute query request",
     })?;
@@ -289,6 +336,12 @@ pub async fn snowflake_query_with_client(
     let query_response = read_response_json::<query_response::Response>(response)
         .await
         .context(InvalidSnowflakeResponseSnafu)?;
+    let elapsed_ms = send_start.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        elapsed_ms,
+        query_id = query_response.data.query_id.as_deref().unwrap_or_default(),
+        "blocking endpoint returned response"
+    );
 
     if !query_response.success {
         let message = query_response
@@ -298,6 +351,27 @@ pub async fn snowflake_query_with_client(
             .fail()
             .context(InvalidSnowflakeResponseSnafu)
     } else {
+        // Log if we retried due to 612, now that we know the actual command type
+        if let Some(sql_prefix) = sql_prefix {
+            let is_file_transfer = query_response
+                .data
+                .command
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case("UPLOAD") || c.eq_ignore_ascii_case("DOWNLOAD"))
+                .unwrap_or(false);
+            if is_file_transfer {
+                tracing::info!(
+                    command = query_response.data.command.as_deref(),
+                    "Retried async 612 with sync; confirmed file transfer"
+                );
+            } else {
+                tracing::warn!(
+                    command = query_response.data.command.as_deref(),
+                    sql_prefix,
+                    "Retried async 612 with sync; unexpected non-file-transfer query"
+                );
+            }
+        }
         Ok(query_response)
     }
 }
@@ -337,6 +411,11 @@ where
     let response_text = response.text().await;
 
     if !response_status.is_success() {
+        // TODO(session-refresh): Implement automatic session renewal on 401.
+        // See gosnowflake's renewRestfulSession and TODO in async_exec.rs.
+        if response_status == reqwest::StatusCode::UNAUTHORIZED {
+            return SessionExpiredSnafu.fail();
+        }
         return ResponseStatusSnafu {
             status: response_status,
             message: response_text.unwrap_or("Unknown error".to_string()),
@@ -454,6 +533,11 @@ pub enum SnowflakeResponseError {
     ResponseStatus {
         status: reqwest::StatusCode,
         message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Session expired - reauthentication required"))]
+    SessionExpired {
         #[snafu(implicit)]
         location: Location,
     },
