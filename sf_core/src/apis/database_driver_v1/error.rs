@@ -1,6 +1,7 @@
 use snafu::{Location, Snafu};
 
 pub use crate::apis::database_driver_v1::query::QueryResponseProcessingError;
+pub use crate::apis::database_driver_v1::statement::StatementError;
 pub use crate::config::ConfigError;
 pub use crate::rest::snowflake::RestError;
 use crate::tls::error::TlsError;
@@ -69,5 +70,28 @@ pub enum ApiError {
         location: Location,
         #[snafu(source(from(QueryResponseProcessingError, Box::new)))]
         source: Box<QueryResponseProcessingError>,
+    },
+    #[snafu(display("Failed to refresh session: {source}"))]
+    SessionRefresh {
+        #[snafu(implicit)]
+        location: Location,
+        source: RestError,
+    },
+    #[snafu(display("Statement error: {source}"))]
+    Statement {
+        #[snafu(implicit)]
+        location: Location,
+        source: StatementError,
+    },
+    #[snafu(display("Query execution failed: {source}"))]
+    Query {
+        #[snafu(implicit)]
+        location: Location,
+        source: RestError,
+    },
+    #[snafu(display("Master token expired, full re-authentication required"))]
+    MasterTokenExpired {
+        #[snafu(implicit)]
+        location: Location,
     },
 }

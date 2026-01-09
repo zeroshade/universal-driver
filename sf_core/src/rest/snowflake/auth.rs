@@ -1,5 +1,17 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Deserialize seconds as Duration
+pub fn deserialize_seconds_as_duration<'de, D>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let secs: Option<u64> = Option::deserialize(deserializer)?;
+    Ok(secs.map(Duration::from_secs))
+}
 
 // TODO: Delete all unused fields when we are sure they are not needed
 
@@ -93,13 +105,25 @@ pub struct AuthResponseSessionInfo {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthResponseMain {
+    /// Session token for authenticating requests
     pub token: Option<String>,
-    #[serde(rename = "validityInSeconds")]
-    pub _validity: Option<u64>,
+    /// Session token validity
+    #[serde(
+        rename = "validityInSeconds",
+        deserialize_with = "deserialize_seconds_as_duration",
+        default
+    )]
+    pub validity: Option<Duration>,
+    /// Master token for refreshing expired session tokens
     #[serde(rename = "masterToken")]
-    pub _master_token: Option<String>,
-    #[serde(rename = "masterValidityInSeconds")]
-    pub _master_validity: Option<u64>,
+    pub master_token: Option<String>,
+    /// Master token validity
+    #[serde(
+        rename = "masterValidityInSeconds",
+        deserialize_with = "deserialize_seconds_as_duration",
+        default
+    )]
+    pub master_validity: Option<Duration>,
     #[serde(rename = "mfaToken")]
     pub _mfa_token: Option<String>,
     #[serde(rename = "mfaTokenValidityInSeconds")]
@@ -122,8 +146,9 @@ pub struct AuthResponseMain {
     pub _health_check_interval: Option<u64>,
     #[serde(rename = "newClientForUpgrade")]
     pub _new_client_for_upgrade: Option<String>,
+    /// Session ID for the current session
     #[serde(rename = "sessionId")]
-    pub _session_id: Option<i64>,
+    pub session_id: Option<i64>,
     #[serde(rename = "parameters")]
     pub _parameters: Option<Vec<NameValueParameter>>,
     #[serde(rename = "sessionInfo")]
