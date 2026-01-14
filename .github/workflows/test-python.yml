@@ -20,8 +20,13 @@ env:
   PYTHON_CORE_MODULE_PATH: "${{ github.workspace }}/python/src/snowflake/ud_connector/_core"
 
 jobs:
+  detect-changes:
+    uses: ./.github/workflows/detect-changes.yml
+
   # Build Rust core library once and share across Python jobs
   build_rust_core:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_python == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -51,14 +56,14 @@ jobs:
 
   # Combined unit + integration tests with universal connector
   python_tests:
-    needs: build_rust_core
+    needs: [detect-changes, build_rust_core]
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_python == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
         py: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
 
@@ -127,9 +132,9 @@ jobs:
 
   # Integration tests only with reference connector (for comparison)
   python_tests_reference:
-    needs: build_rust_core
+    needs: [detect-changes, build_rust_core]
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_python == 'true'
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     continue-on-error: true  # Reference tests expected to fail due to behavioral differences
     steps:
       - uses: actions/checkout@v4
@@ -188,8 +193,11 @@ jobs:
 
   # Compare results between connectors
   python_compare_results:
-    needs: [python_tests, python_tests_reference]
-    if: always()  # Run comparison even if reference tests fail (we want to see the differences)
+    needs: [detect-changes, python_tests, python_tests_reference]
+    if: |
+      always() &&
+      needs.python_tests.result != 'skipped' &&
+      needs.python_tests_reference.result != 'skipped'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -201,10 +209,10 @@ jobs:
 
       - name: Download universal test results
         uses: actions/download-artifact@v4
-        with: 
+        with:
           name: results-universal-${{ env.REFERENCE_OS_VERSION }}-${{ env.REFERENCE_PYTHON_VERSION }}
           path: ${{ github.workspace }}/universal-results
-      
+
       - name: Download reference test results
         uses: actions/download-artifact@v4
         with:
@@ -223,3 +231,40 @@ jobs:
             --reference ${{ github.workspace }}/reference-results/reference-${{ env.REFERENCE_OS_VERSION }}-${{ env.REFERENCE_PYTHON_VERSION }}.json \
             --fail-on-regressions 0 | tee -a $GITHUB_STEP_SUMMARY
         working-directory: python
+
+  python-status:
+    needs: [detect-changes, build_rust_core, python_tests, python_tests_reference, python_compare_results]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check status
+        run: |
+          echo "=== Python CI Status ==="
+          
+          # Check if tests were skipped
+          if [[ "${{ needs.python_tests.result }}" == "skipped" ]]; then
+            echo "✓ Python tests were SKIPPED (no relevant changes detected)"
+            echo "  - run_python: ${{ needs.detect-changes.outputs.run_python }}"
+            exit 0
+          fi
+          
+          # Check if critical jobs failed or were cancelled
+          # Note: python_tests_reference has continue-on-error:true, so we don't fail on it
+          if [[ "${{ needs.build_rust_core.result }}" =~ ^(failure|cancelled)$ ]] || \
+             [[ "${{ needs.python_tests.result }}" =~ ^(failure|cancelled)$ ]] || \
+             [[ "${{ needs.python_compare_results.result }}" =~ ^(failure|cancelled)$ ]]; then
+            echo "✗ Python CI FAILED or CANCELLED"
+            echo "  - build_rust_core: ${{ needs.build_rust_core.result }}"
+            echo "  - python_tests: ${{ needs.python_tests.result }}"
+            echo "  - python_tests_reference: ${{ needs.python_tests_reference.result }} (continue-on-error)"
+            echo "  - python_compare_results: ${{ needs.python_compare_results.result }}"
+            exit 1
+          fi
+          
+          # Tests ran and passed
+          echo "✓ Python CI PASSED"
+          echo "  - build_rust_core: ${{ needs.build_rust_core.result }}"
+          echo "  - python_tests: ${{ needs.python_tests.result }}"
+          echo "  - python_tests_reference: ${{ needs.python_tests_reference.result }} (continue-on-error)"
+          echo "  - python_compare_results: ${{ needs.python_compare_results.result }}"
+          exit 0

@@ -6,7 +6,12 @@ on:
     branches: [ main ]
 
 jobs:
+  detect-changes:
+    uses: ./.github/workflows/detect-changes.yml
+
   test-data:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -45,6 +50,8 @@ jobs:
           echo "Generated test data matches repository."
 
   proto:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_rust_core == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -59,6 +66,8 @@ jobs:
         run: git diff --exit-code
 
   tests-format-validator:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -67,3 +76,38 @@ jobs:
       - name: Run tests format validator
         run: |
           cargo run --bin tests_format_validator --manifest-path tests/tests_format_validator/Cargo.toml
+
+  validations-status:
+    needs: [detect-changes, test-data, proto, tests-format-validator]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check status
+        run: |
+          echo "=== Validations Status ==="
+          
+          # Check if all validations were skipped (docs-only)
+          if [[ "${{ needs.test-data.result }}" == "skipped" ]] && \
+             [[ "${{ needs.proto.result }}" == "skipped" ]] && \
+             [[ "${{ needs.tests-format-validator.result }}" == "skipped" ]]; then
+            echo "✓ Validations were SKIPPED (documentation-only changes)"
+            exit 0
+          fi
+          
+          # Check if any validation failed or was cancelled
+          if [[ "${{ needs.test-data.result }}" =~ ^(failure|cancelled)$ ]] || \
+             [[ "${{ needs.proto.result }}" =~ ^(failure|cancelled)$ ]] || \
+             [[ "${{ needs.tests-format-validator.result }}" =~ ^(failure|cancelled)$ ]]; then
+            echo "✗ Validations were RUN and FAILED or CANCELLED"
+            echo "  - test-data: ${{ needs.test-data.result }}"
+            echo "  - proto: ${{ needs.proto.result }}"
+            echo "  - tests-format-validator: ${{ needs.tests-format-validator.result }}"
+            exit 1
+          fi
+          
+          # Validations ran and passed
+          echo "✓ Validations were RUN and PASSED"
+          echo "  - test-data: ${{ needs.test-data.result }}"
+          echo "  - proto: ${{ needs.proto.result }}"
+          echo "  - tests-format-validator: ${{ needs.tests-format-validator.result }}"
+          exit 0

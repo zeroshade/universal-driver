@@ -9,7 +9,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  detect-changes:
+    uses: ./.github/workflows/detect-changes.yml
+
   jdbc_tests:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_jdbc == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -56,3 +61,29 @@ jobs:
           flags: jdbc
           name: jdbc-${{ runner.os }}-java${{ matrix.java-version }}
           fail_ci_if_error: false
+
+  jdbc-status:
+    needs: [detect-changes, jdbc_tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check status
+        run: |
+          echo "=== JDBC CI Status ==="
+          
+          # Check if tests were skipped
+          if [[ "${{ needs.jdbc_tests.result }}" == "skipped" ]]; then
+            echo "✓ JDBC tests were SKIPPED (no relevant changes detected)"
+            echo "  - run_jdbc: ${{ needs.detect-changes.outputs.run_jdbc }}"
+            exit 0
+          fi
+          
+          # Check if tests failed or were cancelled
+          if [[ "${{ needs.jdbc_tests.result }}" =~ ^(failure|cancelled)$ ]]; then
+            echo "✗ JDBC tests were RUN and FAILED or CANCELLED"
+            exit 1
+          fi
+          
+          # Tests ran and passed
+          echo "✓ JDBC tests were RUN and PASSED"
+          exit 0

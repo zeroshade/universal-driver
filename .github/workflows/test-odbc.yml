@@ -10,7 +10,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  detect-changes:
+    uses: ./.github/workflows/detect-changes.yml
+
   odbc_tests_reference:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_odbc == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -49,6 +54,8 @@ jobs:
           ctest -j $(nproc) -C Debug --test-dir cmake-build --output-on-failure
 
   odbc_tests:
+    needs: detect-changes
+    if: github.event_name == 'push' || needs.detect-changes.outputs.run_odbc == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -114,3 +121,32 @@ jobs:
           flags: odbc
           name: odbc-${{ runner.os }}
           fail_ci_if_error: false
+
+  odbc-status:
+    needs: [detect-changes, odbc_tests_reference, odbc_tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check status
+        run: |
+          echo "=== ODBC CI Status ==="
+          
+          # Check if tests were skipped
+          if [[ "${{ needs.odbc_tests.result }}" == "skipped" ]]; then
+            echo "✓ ODBC tests were SKIPPED (no relevant changes detected)"
+            echo "  - run_odbc: ${{ needs.detect-changes.outputs.run_odbc }}"
+            exit 0
+          fi
+          
+          # Check if tests failed or were cancelled
+          if [[ "${{ needs.odbc_tests_reference.result }}" =~ ^(failure|cancelled)$ ]] || \
+             [[ "${{ needs.odbc_tests.result }}" =~ ^(failure|cancelled)$ ]]; then
+            echo "✗ ODBC tests were RUN and FAILED or CANCELLED"
+            echo "  - odbc_tests_reference: ${{ needs.odbc_tests_reference.result }}"
+            echo "  - odbc_tests: ${{ needs.odbc_tests.result }}"
+            exit 1
+          fi
+          
+          # Tests ran and passed
+          echo "✓ ODBC tests were RUN and PASSED"
+          exit 0
