@@ -2,8 +2,9 @@
 pytest configuration and fixtures for PEP 249 tests.
 """
 
-import pytest
 from urllib.parse import urlparse
+
+import pytest
 
 from .compatibility import set_current_connector
 from .connector_factory import ConnectorFactory, create_connection_with_adapter
@@ -41,9 +42,7 @@ def connector_adapter(request, connector_type):
     reference_package = request.config.getoption("--reference-package")
 
     if connector_type == ConnectorType.REFERENCE:
-        return ConnectorFactory.create_adapter(
-            connector_type, package_name=reference_package
-        )
+        return ConnectorFactory.create_adapter(connector_type, package_name=reference_package)
 
     return ConnectorFactory.create_adapter(connector_type)
 
