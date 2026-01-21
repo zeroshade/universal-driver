@@ -12,7 +12,7 @@ flags:
     paths: ["python/**"]
     carryforward: false
   jdbc:
-    paths: ["jdbc/**", "jdbc_bridge/**"]
+    paths: ["jdbc/**"]
     carryforward: false
   odbc:
     paths: ["odbc/**"]
@@ -63,66 +63,35 @@ component_management:
       name: "JDBC Driver"
       paths:
         - "jdbc/**"
-        - "jdbc_bridge/**"
     - component_id: odbc
       name: "ODBC Driver"
       paths:
         - "odbc/**"
 
+fixes:
+  - "com/snowflake/::jdbc/src/java/com/snowflake/"
+
 ignore:
-  # Test files and documentation
-  - "tests/"
-  - "tests/**/*"
-  - "**/tests/"
-  - "**/tests/**/*"
-  - "**/*.md"
-  - "odbc_tests/"
-  - "odbc_tests/**/*"
-  - "scripts/"
-  
-  # Specific test paths to exclude
+  # Test files
+  - "tests/**"
+  - "**/tests/**"
+  - "odbc_tests/**"
+  - "jdbc/src/test/**"
   - "sf_core/tests/**"
-  - "**/tests/common/**"
-  - "tests/common/**"
-  - "tests/tests_format_validator/**"
   
   # Build artifacts
   - "**/target/"
   - "**/build/"
   
-  # Configuration files
-  - "**/*.toml"
-  - "**/*.lock"
-  
-  # Python artifacts
-  - "**/__pycache__/"
-  - "**/*.pyc"
-  - "**/*.pyo"
-  - "**/.pytest_cache/"
-  - "**/.tox/"
-  - "**/dist/"
-  - "**/*.egg-info/"
-  
   # Generated code
   - "**/protobuf_gen/"
   - "**/gen-*/"
   
-  # Java/Gradle artifacts
-  - "**/.gradle/"
-  - "**/gradlew*"
-  - "**/*.class"
-  
-  # CMake artifacts
-  - "**/CMakeCache.txt"
-  - "**/CMakeFiles/"
-  - "**/cmake_install.cmake"
-  - "**/cmake-build/"
-  
-  # IDE and OS files
-  - "**/.idea/"
-  - "**/.vscode/"
-  - "**/.DS_Store"
-  - "**/*.swp"
+  # Configuration/documentation
+  - "**/*.md"
+  - "**/*.toml"
+  - "**/*.lock"
+  - "scripts/"
 
 github_checks:
   annotations: true
