@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 import warnings
+
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+
 
 # Graceful fallback if Cython or setuptools are not available
 try:
@@ -85,12 +90,10 @@ class NanoarrowBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         """Initialize the build hook and compile extensions."""
         if self.target_name != "wheel":
+            # For source distribution
             return
 
-        if (
-            os.environ.get(self.DISABLE_COMPILE_ENV_VAR, "false").lower()
-            in self.POSITIVE_VALUES
-        ):
+        if os.environ.get(self.DISABLE_COMPILE_ENV_VAR, "false").lower() in self.POSITIVE_VALUES:
             return
 
         if not CYTHON_AVAILABLE:
@@ -103,6 +106,7 @@ class NanoarrowBuildHook(BuildHookInterface):
             return
 
         self._build_extensions()
+        self._build_core()
 
     def _build_extensions(self) -> None:
         """Build the Cython extensions."""
@@ -147,9 +151,7 @@ class NanoarrowBuildHook(BuildHookInterface):
                 ext.extra_compile_args.append("/std:c++17")
         elif sys.platform in ("linux", "darwin"):
             if "std=" not in os.environ.get("CXXFLAGS", ""):
-                ext.extra_compile_args.extend(
-                    ["-std=c++11", "-D_GLIBCXX_USE_CXX11_ABI=0"]
-                )
+                ext.extra_compile_args.extend(["-std=c++11", "-D_GLIBCXX_USE_CXX11_ABI=0"])
             # Define endianness for flatcc
             ext.extra_compile_args.extend(
                 [
@@ -157,9 +159,7 @@ class NanoarrowBuildHook(BuildHookInterface):
                     "-DFLATBUFFERS_PROTOCOL_IS_LE=1",
                 ]
             )
-            if sys.platform == "darwin" and "macosx-version-min" not in os.environ.get(
-                "CXXFLAGS", ""
-            ):
+            if sys.platform == "darwin" and "macosx-version-min" not in os.environ.get("CXXFLAGS", ""):
                 ext.extra_compile_args.append("-mmacosx-version-min=10.13")
 
     def _apply_link_flags(self, ext: Extension) -> None:
@@ -171,7 +171,6 @@ class NanoarrowBuildHook(BuildHookInterface):
 
     def _run_build(self, extensions: list, src_root: Path) -> None:
         """Run the build using setuptools Distribution."""
-
         c_files_for_c99 = self.C_FILES_FOR_C99
 
         class CustomBuildExt(build_ext):
@@ -180,20 +179,12 @@ class NanoarrowBuildHook(BuildHookInterface):
             def build_extension(self, ext):
                 original_compile = self.compiler._compile
 
-                def new_compile(
-                    obj, src: str, ext_arg, cc_args, extra_postargs, pp_opts
-                ):
+                def new_compile(obj, src: str, ext_arg, cc_args, extra_postargs, pp_opts):
                     # Handle C files differently from C++ files
                     if src.endswith(c_files_for_c99):
-                        extra_postargs = [
-                            s
-                            for s in extra_postargs
-                            if s not in ("-std=c++17", "-std=c++11")
-                        ]
+                        extra_postargs = [s for s in extra_postargs if s not in ("-std=c++17", "-std=c++11")]
                         extra_postargs.append("-std=c99")
-                    return original_compile(
-                        obj, src, ext_arg, cc_args, extra_postargs, pp_opts
-                    )
+                    return original_compile(obj, src, ext_arg, cc_args, extra_postargs, pp_opts)
 
                 self.compiler._compile = new_compile
 
@@ -210,3 +201,56 @@ class NanoarrowBuildHook(BuildHookInterface):
         cmd.build_lib = str(src_root)
         cmd.inplace = True
         cmd.run()
+
+    def _build_core(self) -> None:
+        """Build the Rust core library in release mode for distribution."""
+        print()
+        print("Building Rust core library...")
+
+        # Get paths relative to the Python wrapper directory
+        python_dir = Path(__file__).parent
+        cargo_manifest = python_dir.parent / "Cargo.toml"
+        target_dir = python_dir / "src" / "snowflake" / "ud_connector" / "_core"
+
+        # Ensure target directory exists
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build the Rust core library in release mode with optimizations
+        with TemporaryDirectory() as temp_dir:
+            cargo_args = [
+                "cargo",
+                "build",
+                "--release",
+                "--package",
+                "sf_core",
+                "--manifest-path",
+                str(cargo_manifest),
+                "--target-dir",
+                str(temp_dir),
+            ]
+
+            try:
+                result = subprocess.run(
+                    cargo_args,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                print(result.stdout)
+            except subprocess.CalledProcessError as e:
+                print(f"Cargo build failed with exit code {e.returncode}")
+                print(f"stdout: {e.stdout}")
+                print(f"stderr: {e.stderr}")
+                raise
+
+            # Copy built artifacts from release directory to _core directory
+            release_dir = Path(temp_dir) / "release"
+            if not release_dir.exists():
+                raise Exception("Rust distribution build not present")
+            print("Copying release artifacts")
+            for file in release_dir.rglob("*"):
+                if file.is_file() and file.suffix in (".dylib", ".so", ".dll"):
+                    shutil.copy2(file, target_dir)
+
+
+        print("Core library build complete!")
