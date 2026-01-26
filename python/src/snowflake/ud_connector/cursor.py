@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from ._internal.arrow_context import ArrowConverterContext
-from ._internal.arrow_stream_iterator import ArrowStreamIterator  # type: ignore[import-untyped]
+from ._internal.arrow_stream_iterator import ArrowStreamIterator  # type: ignore[import-not-found]
 from ._internal.protobuf_gen.database_driver_v1_pb2 import (  # type: ignore[attr-defined]
     StatementExecuteQueryRequest,
     StatementNewRequest,
@@ -124,6 +124,7 @@ class Cursor:
         self.execute_result = self.connection.db_api.statement_execute_query(
             StatementExecuteQueryRequest(stmt_handle=stmt_handle)
         ).result
+
         # Reset streaming state for a new result
         self._iterator = None
 
@@ -141,8 +142,32 @@ class Cursor:
         raise NotSupportedError("executemany is not implemented")
 
     def _get_stream_ptr(self) -> int:
-        """Get the ArrowArrayStream pointer from execute result."""
-        stream_ptr = int.from_bytes(self.execute_result.stream.value, byteorder="little", signed=False)
+        """Get the ArrowArrayStream pointer from execute result.
+
+        Returns:
+            int: The ArrowArrayStream pointer as an integer
+
+        Raises:
+            RuntimeError: If execute_result is invalid or stream pointer is null
+        """
+        if self.execute_result is None:
+            raise RuntimeError("No query has been executed")
+
+        if not hasattr(self.execute_result, "stream") or self.execute_result.stream is None:
+            raise RuntimeError("Execute result does not contain a valid stream")
+
+        if not hasattr(self.execute_result.stream, "value") or self.execute_result.stream.value is None:
+            raise RuntimeError("Stream does not contain a valid pointer value")
+
+        stream_value = self.execute_result.stream.value
+        if len(stream_value) != 8:
+            raise RuntimeError(f"Stream pointer value has wrong length: {len(stream_value)} (expected 8)")
+
+        stream_ptr = int.from_bytes(stream_value, byteorder="little", signed=False)
+
+        if stream_ptr == 0:
+            raise RuntimeError("Stream pointer is null")
+
         return stream_ptr
 
     def _ensure_iterator(self) -> None:
