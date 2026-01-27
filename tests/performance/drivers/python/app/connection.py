@@ -1,7 +1,7 @@
 """Connection management and connector selection."""
-
+import importlib.util
 from importlib.metadata import version, PackageNotFoundError
-
+from pathlib import Path
 
 
 def create_connection(driver_type, conn_params):
@@ -52,14 +52,25 @@ def execute_setup_queries(cursor, setup_queries):
     print("✓ Setup queries completed")
 
 
+def _load_from_sources():
+    legacy_path = Path(__file__).parent.parent / "old_driver_src"
+
+    package_name = "snowflake.connector"
+    spec = importlib.util.find_spec(package_name, [legacy_path])
+    if spec is None:
+        raise ImportError(f"Could not find '{package_name}' in {legacy_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _get_connector(driver_type):
     """Get the appropriate connector module based on driver type."""
     if driver_type == "old":
-        import snowflake.connector
-        return snowflake.connector
+        return _load_from_sources()
     else:  # universal
-        from snowflake import ud_connector
-        return ud_connector
+        from snowflake import connector
+        return connector
 
 
 def _get_driver_version(driver_type):

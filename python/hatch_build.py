@@ -36,14 +36,14 @@ class NanoarrowBuildHook(BuildHookInterface):
     PLUGIN_NAME = "nanoarrow"
 
     # Relative paths from src/
-    CONNECTOR_DIR = Path("snowflake") / "ud_connector"
+    CONNECTOR_DIR = Path("snowflake") / "connector"
     INTERNAL_DIR = CONNECTOR_DIR / "_internal"
     NANOARROW_CPP_DIR = INTERNAL_DIR / "nanoarrow_cpp"
     ARROW_ITERATOR_DIR = NANOARROW_CPP_DIR / "ArrowIterator"
     LOGGING_DIR = NANOARROW_CPP_DIR / "Logging"
 
     # Extension module name
-    EXTENSION_NAME = "snowflake.ud_connector._internal.arrow_stream_iterator"
+    EXTENSION_NAME = "snowflake.connector._internal.arrow_stream_iterator"
     PYX_SOURCE = ARROW_ITERATOR_DIR / "arrow_stream_iterator.pyx"
 
     # C++ source files in ArrowIterator directory
@@ -210,7 +210,7 @@ class NanoarrowBuildHook(BuildHookInterface):
         # Get paths relative to the Python wrapper directory
         python_dir = Path(__file__).parent
         cargo_manifest = python_dir.parent / "Cargo.toml"
-        target_dir = python_dir / "src" / "snowflake" / "ud_connector" / "_core"
+        target_dir = python_dir / "src" / "snowflake" / "connector" / "_core"
 
         # Ensure target directory exists
         target_dir.mkdir(parents=True, exist_ok=True)
