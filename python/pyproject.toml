@@ -65,10 +65,12 @@ path = "hatch_build.py"
 [project.optional-dependencies]
 test = [
     "pytest>=8",
-    "pytest-xdist",
     "pytest-json-report",
     "pytest-split",
     "pytest-cov",
+    "pytest-xdist",
+    "pytest-randomly",
+    "pytest-timeout",
     "hypothesis",
     "requests",
     "brotli",
@@ -88,8 +90,12 @@ python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
     "--strict-config",
-    "-v",
+    "-vv",
+    "-n 16",
+    "--durations=0",
 ]
+# Default timeout for tests (2 minutes) - prevents hanging tests on CI
+timeout = 120
 markers = [
     "skip_reference(reason: str=''): skip when --connector=reference",
     "skip_universal(reason: str=''): skip when --connector=universal",
