@@ -625,6 +625,8 @@ impl DatabaseDriver for DatabaseDriverImpl {
             result: Some(ExecuteResult {
                 stream: Some(stream_ptr),
                 rows_affected: result.rows_affected,
+                query_id: result.query_id,
+                columns: result.columns,
             }),
         })
     }

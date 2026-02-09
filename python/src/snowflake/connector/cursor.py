@@ -14,15 +14,17 @@ from __future__ import annotations
 import abc
 
 from collections.abc import Iterator, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from ._internal.arrow_context import ArrowConverterContext
 from ._internal.arrow_stream_iterator import ArrowStreamIterator  # type: ignore[import-not-found]
 from ._internal.protobuf_gen.database_driver_v1_pb2 import (  # type: ignore[attr-defined]
+    ExecuteResult,
     StatementExecuteQueryRequest,
     StatementNewRequest,
     StatementSetSqlQueryRequest,
 )
+from ._internal.type_codes import get_type_code
 from .errors import NotSupportedError, ProgrammingError
 
 
@@ -31,6 +33,49 @@ if TYPE_CHECKING:
 
 Row = tuple[Any, ...]
 DictRow = dict[str, Any]
+
+
+class ResultMetadata(NamedTuple):
+    """PEP 249 column description entry.
+
+    Each item in ``Cursor.description`` is a ``ResultMetadata`` instance.
+    Being a :class:`~typing.NamedTuple` it is fully tuple-compatible as
+    required by the spec, while also providing named attribute access.
+    """
+
+    name: str
+    type_code: int
+    display_size: int | None
+    internal_size: int | None
+    precision: int | None
+    scale: int | None
+    is_nullable: bool | None
+
+    @classmethod
+    def from_column(cls, col: Any) -> ResultMetadata:
+        """Create a ``ResultMetadata`` from a protobuf ``ColumnMetadata``."""
+        type_code = get_type_code(col.type)
+
+        display_size = (
+            col.length if col.HasField("length") and col.type.upper() in ("TEXT", "VARCHAR", "CHAR", "STRING") else None
+        )
+        internal_size = col.byte_length if col.HasField("byte_length") else None
+        precision = col.precision if col.HasField("precision") else None
+        scale = col.scale if col.HasField("scale") else None
+
+        return cls(
+            name=col.name,
+            type_code=type_code,
+            display_size=display_size,
+            internal_size=internal_size,
+            precision=precision,
+            scale=scale,
+            is_nullable=col.nullable,
+        )
+
+
+# Backward compatibility alias
+ResultMetadataV2 = ResultMetadata
 
 
 class SnowflakeCursorBase(abc.ABC):
@@ -53,15 +98,15 @@ class SnowflakeCursorBase(abc.ABC):
             connection: Connection object that created this cursor
         """
         self.connection = connection
-        self.description = None
-        self.rowcount = -1
+        self._description: list[ResultMetadata] | None = None
+        self._rowcount = None
         self.arraysize = 1  # Instance attribute overrides class attribute
         self._closed = False
         # Streaming state for Arrow results
         self._reader = None
         self._current_batch = None
         self._current_row_in_batch = 0
-        self.execute_result: Any = None
+        self.execute_result: ExecuteResult = None
         self._iterator: Iterator[Row] | Iterator[DictRow] | None = None
 
     # ------------------------------------------------------------------
@@ -69,34 +114,33 @@ class SnowflakeCursorBase(abc.ABC):
     # ------------------------------------------------------------------
 
     @property
-    def description(self) -> Any:
+    def description(self) -> list[ResultMetadata] | None:
         """
         Read-only attribute describing the result columns of a query.
 
-        Returns:
-            tuple: Sequence of 7-item tuples describing each result column:
-                   (name, type_code, display_size, internal_size, precision, scale, null_ok)
+        Returns a sequence of 7-item tuples, each containing:
+        - name: Column name (str)
+        - type_code: Integer type code (int)
+        - display_size: Display size in characters (int | None)
+        - internal_size: Internal size in bytes (int | None)
+        - precision: Precision for numeric types (int | None)
+        - scale: Scale for numeric types (int | None)
+        - null_ok: True if column can contain NULLs (bool | None)
+
+        Returns None if no query has been executed or if the query didn't produce a result set.
         """
         return self._description
 
-    @description.setter
-    def description(self, value: Any) -> None:
-        self._description = value
-
     @property
-    def rowcount(self) -> int:
+    def rowcount(self) -> int | None:
         """
         Read-only attribute specifying the number of rows that the last
         .execute*() produced or affected.
 
         Returns:
-            int: Number of rows affected, or -1 if not determined
+            int: Number of rows affected, or None if not determined
         """
         return self._rowcount
-
-    @rowcount.setter
-    def rowcount(self, value: int) -> None:
-        self._rowcount = value
 
     # ------------------------------------------------------------------
     # Result format control
@@ -110,6 +154,18 @@ class SnowflakeCursorBase(abc.ABC):
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
+
+    @property
+    def sfqid(self) -> str | None:
+        """
+        Read-only attribute containing the Snowflake Query ID for the last executed query.
+
+        Returns:
+            str | None: Snowflake Query ID (UUID format), or None if no query has been executed
+        """
+        if self.execute_result is None:
+            return None
+        return self.execute_result.query_id if self.execute_result.query_id else None
 
     def callproc(self, procname: str, parameters: Sequence[Any] | None = None) -> Sequence[Any]:
         """
@@ -151,7 +207,17 @@ class SnowflakeCursorBase(abc.ABC):
 
         # Reset streaming state for a new result
         self._iterator = None
+
+        # Populate description and rowcount
+        self._populate_description()
+        self._populate_rowcount()
         return self
+
+    def _populate_rowcount(self) -> None:
+        if self.execute_result:
+            self._rowcount = self.execute_result.rows_affected
+        else:
+            self._rowcount = None
 
     def executemany(self, operation: str, seq_of_parameters: Sequence[Sequence[Any]]) -> None:
         """
@@ -198,6 +264,19 @@ class SnowflakeCursorBase(abc.ABC):
             raise RuntimeError("Stream pointer is null")
 
         return stream_ptr
+
+    def _populate_description(self) -> None:
+        """Populate cursor description from execute result column metadata."""
+        if self.execute_result is None:
+            self._description = None
+            return
+
+        columns = self.execute_result.columns
+        if not columns:
+            self._description = None
+            return
+
+        self._description = [ResultMetadata.from_column(col) for col in columns]
 
     def _get_iterator(self) -> ArrowStreamIterator:
         stream_ptr = self._get_stream_ptr()
