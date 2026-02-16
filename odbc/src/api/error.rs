@@ -58,6 +58,20 @@ pub enum OdbcError {
         location: Location,
     },
 
+    #[snafu(display("Unsupported attribute: {attribute}"))]
+    UnsupportedAttribute {
+        attribute: i32,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Attribute cannot be set now: {attribute}"))]
+    AttributeCannotBeSetNow {
+        attribute: i32,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Parameter number cannot be 0"))]
     InvalidParameterNumber {
         #[snafu(implicit)]
@@ -236,6 +250,10 @@ static AUTHENTICATOR_PARAMETERS: LazyLock<HashSet<String>> = LazyLock::new(|| {
     set.insert("PRIV_KEY_FILE".to_string());
     set.insert("PRIVATE_KEY_FILE".to_string());
     set.insert("PRIV_KEY_FILE_PWD".to_string());
+    set.insert("PRIV_KEY_BASE64".to_string());
+    set.insert("PRIV_KEY_PWD".to_string());
+    set.insert("PRIVATE_KEY".to_string());
+    set.insert("PRIVATE_KEY_PASSWORD".to_string());
     set.insert("TOKEN".to_string());
     set.insert("AUTHENTICATOR".to_string());
     set.insert("USER".to_string());
@@ -261,7 +279,9 @@ impl OdbcError {
             OdbcError::InvalidDiagnosticIdentifier { .. } => {
                 SqlState::InvalidDescriptorFieldIdentifier
             }
-            OdbcError::UnknownAttribute { .. } => SqlState::GeneralError,
+            OdbcError::UnknownAttribute { .. } => SqlState::InvalidAttributeOptionIdentifier,
+            OdbcError::UnsupportedAttribute { .. } => SqlState::OptionalFeatureNotImplemented,
+            OdbcError::AttributeCannotBeSetNow { .. } => SqlState::AttributeCannotBeSetNow,
             OdbcError::InvalidParameterNumber { .. } => SqlState::WrongNumberOfParameters,
             OdbcError::StatementNotExecuted { .. } => SqlState::FunctionSequenceError,
             OdbcError::DataNotFetched { .. } => SqlState::FunctionSequenceError,
