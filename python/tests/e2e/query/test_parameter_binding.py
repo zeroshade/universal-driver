@@ -12,16 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from snowflake.connector import ProgrammingError
-
-
-# TODO: syntax parity will be implemented in follow-up PR
-pytestmark = pytest.mark.skip_reference
+from ...conftest import with_paramstyle
 
 
 class TestBasicTypeBinding:
     """Tests for binding basic Python types to Snowflake."""
 
+    @with_paramstyle("qmark")
     def test_should_bind_basic_types_with_positional_parameters(self, cursor):
         # Given Snowflake client is logged in
 
@@ -39,6 +36,7 @@ class TestBasicTypeBinding:
         assert result[3] is True
         assert result[4] is None
 
+    @with_paramstyle("numeric")
     def test_should_bind_positional_parameters_with_numeric_placeholders(self, cursor):
         # Given Snowflake client is logged in
 
@@ -52,6 +50,7 @@ class TestBasicTypeBinding:
         assert result == (100, "test", True)
 
 
+@with_paramstyle("qmark")
 class TestTableOperations:
     """Tests for parameter binding with table operations."""
 
@@ -157,6 +156,7 @@ class TestTableOperations:
         assert names == {"Alice", "Charlie"}
 
 
+@with_paramstyle("qmark")
 class TestEdgeCases:
     """Tests for edge cases in parameter binding."""
 
@@ -228,12 +228,22 @@ class TestEdgeCases:
 
         # When Query with 3 placeholders is executed with 1 argument
         # Then Error should be raised for too few arguments
-        from snowflake.connector._internal.protobuf_gen.proto_exception import ProtoApplicationException
+        from ...compatibility import IS_UNIVERSAL_DRIVER
 
-        with pytest.raises(ProtoApplicationException):
+        if IS_UNIVERSAL_DRIVER:
+            from snowflake.connector._internal.protobuf_gen.proto_exception import ProtoApplicationException
+
+            expected_error = ProtoApplicationException
+        else:
+            from snowflake.connector import DatabaseError
+
+            expected_error = DatabaseError
+
+        with pytest.raises(expected_error):
             cursor.execute("SELECT ?, ?, ?", (1,))
 
 
+@with_paramstyle("qmark")
 class TestArrayBinding:
     """Tests for multirow binding (executemany functionality)."""
 
@@ -268,13 +278,14 @@ class TestArrayBinding:
     def test_should_validate_parameter_length_in_multirow_binding(self, cursor):
         """Test multirow binding raises error for inconsistent lengths."""
         # Given Snowflake client is logged in
+        from snowflake.connector import InterfaceError
 
         # When Multirow binding is called with inconsistent parameter lengths [(1, "a"), (2, "b", "extra")]
-        with pytest.raises(ProgrammingError) as excinfo:
+        with pytest.raises(InterfaceError) as excinfo:
             cursor.executemany("INSERT INTO table VALUES (?, ?)", [(1, "a"), (2, "b", "extra")])
 
         # Then Error should be raised indicating parameter sequence length mismatch
-        assert "Parameter sequence" in str(excinfo.value)
+        assert "Bulk data size don't match" in str(excinfo.value)
 
     def test_should_handle_null_values_in_multirow_binding(self, cursor, tmp_schema):
         """Test multirow binding handles NULL values."""
@@ -295,6 +306,7 @@ class TestArrayBinding:
         assert result == [(1, None), (2, "value"), (3, None)]
 
 
+@with_paramstyle("qmark")
 class TestBackwardCompatibility:
     """Tests for backward compatibility with old connector parameter format."""
 
@@ -314,6 +326,7 @@ class TestBackwardCompatibility:
         assert result_tuple == result_list == (1, "test")
 
 
+@with_paramstyle("qmark")
 class TestComplexScenarios:
     """Tests for complex parameter binding scenarios."""
 

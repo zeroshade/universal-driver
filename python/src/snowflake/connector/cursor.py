@@ -29,7 +29,7 @@ from ._internal.protobuf_gen.database_driver_v1_pb2 import (
     StatementSetSqlQueryRequest,
 )
 from ._internal.type_codes import get_type_code
-from .errors import NotSupportedError, ProgrammingError
+from .errors import InterfaceError, NotSupportedError, ProgrammingError
 
 
 if TYPE_CHECKING:
@@ -246,6 +246,11 @@ class SnowflakeCursorBase(abc.ABC):
         )
 
         if parameters is not None and not isinstance(parameters, dict):
+            if self.connection._paramstyle is None:
+                raise ProgrammingError(
+                    "Binding parameters requires paramstyle to be set. "
+                    "Pass paramstyle='qmark' or paramstyle='numeric' to connect()."
+                )
             bindings = self._build_query_bindings(parameters)
         else:
             bindings = None
@@ -285,11 +290,13 @@ class SnowflakeCursorBase(abc.ABC):
             return  # Empty sequence - no-op per PEP 249
 
         # Validate all parameter sequences have same length
+        # Error code 251007 (ER_INVALID_VALUE) matches reference driver behavior
         first_len = len(seq_of_parameters[0])
-        for i, params in enumerate(seq_of_parameters):
+        for params in seq_of_parameters:
             if len(params) != first_len:
-                raise ProgrammingError(
-                    f"Parameter sequence at index {i} has {len(params)} elements, expected {first_len}"
+                raise InterfaceError(
+                    f"251007: Bulk data size don't match. expected: {first_len}, "
+                    f"got: {len(params)}, command: {operation}"
                 )
 
         # Transpose from row-major to column-major format
