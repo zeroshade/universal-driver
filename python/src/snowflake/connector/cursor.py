@@ -15,11 +15,15 @@ import abc
 import ctypes
 
 from collections.abc import Iterator, Sequence
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from ._internal.arrow_context import ArrowConverterContext
 from ._internal.arrow_stream_iterator import ArrowStreamIterator
-from ._internal.binding_serializer import BindingSerializer
+from ._internal.binding_converters import (
+    ClientSideBindingConverter,
+    JsonBindingConverter,
+    ParamStyle,
+)
 from ._internal.protobuf_gen.database_driver_v1_pb2 import (
     BinaryDataPtr,
     ExecuteResult,
@@ -196,7 +200,7 @@ class SnowflakeCursorBase(abc.ABC):
     def _build_query_bindings(self, parameters: Sequence[Any]) -> QueryBindings | None:
         """Serialize parameters and build a QueryBindings protobuf message.
 
-        Converts Python parameter values to JSON via BindingSerializer, then
+        Converts Python parameter values to JSON via JsonBindingConverter, then
         wraps the result in a zero-copy BinaryDataPtr so the Rust core can read
         the JSON directly from Python memory.
 
@@ -207,7 +211,7 @@ class SnowflakeCursorBase(abc.ABC):
             QueryBindings with the serialized JSON, or None if parameters
             serialize to nothing (e.g. empty list).
         """
-        json_str, length = BindingSerializer.serialize_parameters(parameters)
+        json_str, length = JsonBindingConverter.serialize_parameters(parameters)
         if json_str is None:
             return None
 
@@ -230,30 +234,66 @@ class SnowflakeCursorBase(abc.ABC):
         )
         return QueryBindings(json=binary_data_ptr)
 
+    def _prepare_query(
+        self, operation: str, parameters: Sequence[Any] | dict[str, Any] | None
+    ) -> tuple[str, QueryBindings | None]:
+        """Prepare query and bindings based on paramstyle.
+
+        Args:
+            operation: SQL statement
+            parameters: Parameters to bind (sequence or dict)
+
+        Returns:
+            Tuple of (query string, QueryBindings or None)
+
+        Raises:
+            ProgrammingError: If dict parameters used with server-side binding
+        """
+        if parameters is None:
+            return operation, None
+
+        paramstyle = self.connection.paramstyle  # Always returns ParamStyle enum
+
+        if paramstyle.is_client_side():
+            # format paramstyle only supports positional params (%s), not named params
+            if paramstyle == ParamStyle.FORMAT and isinstance(parameters, dict):
+                raise ProgrammingError(
+                    "Dict parameters not supported with format paramstyle. "
+                    "Use pyformat paramstyle for named parameters, or use a sequence."
+                )
+            # Client-side binding: interpolate parameters into SQL string
+            query = ClientSideBindingConverter.interpolate_query(operation, parameters)
+            return query, None
+        else:
+            # Server-side binding: qmark or numeric
+            if isinstance(parameters, dict):
+                raise ProgrammingError(
+                    "Named parameters (dict) not supported with qmark/numeric paramstyle. "
+                    "Use pyformat paramstyle for named parameters."
+                )
+            bindings = self._build_query_bindings(parameters)
+            return operation, bindings
+
     def execute(self, operation: str, parameters: Sequence[Any] | dict[str, Any] | None = None) -> SnowflakeCursorBase:
         """
         Execute a database operation (query or command).
 
         Args:
             operation (str): SQL statement to execute
-            parameters (sequence): Parameters for the operation
+            parameters (sequence or dict): Parameters for the operation.
+                For qmark/numeric paramstyle: sequence of values
+                For pyformat paramstyle: sequence (%s) or dict (%(name)s)
+                For format paramstyle: sequence (%s)
         """
+        query, bindings = self._prepare_query(operation, parameters)
+
         stmt_handle = self.connection.db_api.statement_new(
             StatementNewRequest(conn_handle=self.connection.conn_handle)
         ).stmt_handle
         self.connection.db_api.statement_set_sql_query(
-            StatementSetSqlQueryRequest(stmt_handle=stmt_handle, query=operation)
+            StatementSetSqlQueryRequest(stmt_handle=stmt_handle, query=query)
         )
 
-        if parameters is not None and not isinstance(parameters, dict):
-            if self.connection._paramstyle is None:
-                raise ProgrammingError(
-                    "Binding parameters requires paramstyle to be set. "
-                    "Pass paramstyle='qmark' or paramstyle='numeric' to connect()."
-                )
-            bindings = self._build_query_bindings(parameters)
-        else:
-            bindings = None
         request = StatementExecuteQueryRequest(stmt_handle=stmt_handle, bindings=bindings)
 
         self.execute_result = self.connection.db_api.statement_execute_query(request).result
@@ -273,15 +313,17 @@ class SnowflakeCursorBase(abc.ABC):
         else:
             self._rowcount = None
 
-    def executemany(self, operation: str, seq_of_parameters: Sequence[Sequence[Any]]) -> None:
+    def executemany(self, operation: str, seq_of_parameters: Sequence[Sequence[Any] | dict[str, Any]]) -> None:
         """
         Execute a database operation repeatedly for each element in seq_of_parameters.
 
-        Uses array binding to execute all parameter sets in a single request.
+        For qmark/numeric paramstyles, uses array binding to execute all parameter
+        sets in a single request. For pyformat/format paramstyles, executes each
+        row individually with client-side interpolation.
 
         Args:
             operation (str): SQL statement (typically INSERT, UPDATE, or DELETE)
-            seq_of_parameters (sequence): Sequence of parameter sequences
+            seq_of_parameters (sequence): Sequence of parameter sequences or dicts
 
         Raises:
             ProgrammingError: If parameter sequences have inconsistent lengths
@@ -289,10 +331,33 @@ class SnowflakeCursorBase(abc.ABC):
         if not seq_of_parameters:
             return  # Empty sequence - no-op per PEP 249
 
-        # Validate all parameter sequences have same length
+        paramstyle = self.connection.paramstyle
+        first_params = seq_of_parameters[0]
+
+        # Execute individually for:
+        # - Client-side binding (pyformat/format)
+        # - Dict parameters (server-side doesn't support named binding)
+        if paramstyle.is_client_side() or isinstance(first_params, dict):
+            total_rowcount = 0
+            unknown_rowcount = False
+            for params in seq_of_parameters:
+                self.execute(operation, params)
+                rc = self._rowcount
+                if rc is None or rc == -1:
+                    unknown_rowcount = True
+                elif not unknown_rowcount:
+                    total_rowcount += rc
+            # Per PEP 249, -1 indicates that the number of rows is unknown
+            self._rowcount = -1 if unknown_rowcount else total_rowcount
+            return
+
+        # Server-side binding: validate and use array binding
+        # Dict params were handled above; only sequences reach here.
+        rows = cast(Sequence[Sequence[Any]], seq_of_parameters)
+
         # Error code 251007 (ER_INVALID_VALUE) matches reference driver behavior
-        first_len = len(seq_of_parameters[0])
-        for params in seq_of_parameters:
+        first_len = len(first_params)
+        for params in rows:
             if len(params) != first_len:
                 raise InterfaceError(
                     f"251007: Bulk data size don't match. expected: {first_len}, "
@@ -303,7 +368,7 @@ class SnowflakeCursorBase(abc.ABC):
         # Input:  [(row1_col1, row1_col2), (row2_col1, row2_col2), ...]
         # Output: [[row1_col1, row2_col1, ...], [row1_col2, row2_col2, ...]]
         num_columns = first_len
-        transposed = [[row[col_idx] for row in seq_of_parameters] for col_idx in range(num_columns)]
+        transposed = [[row[col_idx] for row in rows] for col_idx in range(num_columns)]
 
         # Execute using array binding (existing path handles list values)
         self.execute(operation, transposed)
