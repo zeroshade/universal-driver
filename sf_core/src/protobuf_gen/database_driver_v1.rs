@@ -575,6 +575,39 @@ pub struct StatementReadPartitionResponse {
     #[prost(int64, tag = "1")]
     pub partition_stream: i64,
 }
+/// Config setting value (union type)
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigSetting {
+    #[prost(oneof = "config_setting::Value", tags = "1, 2, 3, 4")]
+    pub value: ::core::option::Option<config_setting::Value>,
+}
+/// Nested message and enum types in `ConfigSetting`.
+pub mod config_setting {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        StringValue(::prost::alloc::string::String),
+        #[prost(int64, tag = "2")]
+        IntValue(i64),
+        #[prost(double, tag = "3")]
+        DoubleValue(f64),
+        #[prost(bytes, tag = "4")]
+        BytesValue(::prost::alloc::vec::Vec<u8>),
+    }
+}
+/// A config section containing key-value settings
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigSection {
+    #[prost(map = "string, message", tag = "1")]
+    pub settings: ::std::collections::HashMap<::prost::alloc::string::String, ConfigSetting>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfigLoadAllSectionsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigLoadAllSectionsResponse {
+    #[prost(map = "string, message", tag = "1")]
+    pub sections: ::std::collections::HashMap<::prost::alloc::string::String, ConfigSection>,
+}
 /// Status codes corresponding to Thrift StatusCode enum
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -816,6 +849,9 @@ pub trait DatabaseDriver {
     fn statement_read_partition(
         input: StatementReadPartitionRequest,
     ) -> Result<StatementReadPartitionResponse, DriverException>;
+    fn config_load_all_sections(
+        input: ConfigLoadAllSectionsRequest,
+    ) -> Result<ConfigLoadAllSectionsResponse, DriverException>;
 }
 
 pub trait DatabaseDriverServer: DatabaseDriver {
@@ -1223,6 +1259,17 @@ pub trait DatabaseDriverServer: DatabaseDriver {
                     Err(e) => return Err(ProtoError::Transport(e.to_string())),
                 };
                 let result = Self::statement_read_partition(input);
+                match result {
+                    Ok(output) => Ok(output.encode_to_vec()),
+                    Err(e) => Err(ProtoError::Application(e.encode_to_vec())),
+                }
+            }
+            "config_load_all_sections" => {
+                let input = match ConfigLoadAllSectionsRequest::decode(&message[..]) {
+                    Ok(input) => input,
+                    Err(e) => return Err(ProtoError::Transport(e.to_string())),
+                };
+                let result = Self::config_load_all_sections(input);
                 match result {
                     Ok(output) => Ok(output.encode_to_vec()),
                     Err(e) => Err(ProtoError::Application(e.encode_to_vec())),
@@ -2182,6 +2229,33 @@ impl<T: Transport> DatabaseDriverClient<T> {
         match result {
             Ok(output) => {
                 let output = StatementReadPartitionResponse::decode(&output[..]);
+                match output {
+                    Ok(output) => Ok(output),
+                    Err(e) => Err(ProtoError::Transport(e.to_string())),
+                }
+            }
+            Err(ProtoError::Application(e)) => {
+                let output = DriverException::decode(&e[..]);
+                match output {
+                    Ok(output) => Err(ProtoError::Application(output)),
+                    Err(e) => Err(ProtoError::Transport(e.to_string())),
+                }
+            }
+            Err(ProtoError::Transport(e)) => Err(ProtoError::Transport(e)),
+        }
+    }
+
+    pub fn config_load_all_sections(
+        input: ConfigLoadAllSectionsRequest,
+    ) -> Result<ConfigLoadAllSectionsResponse, ProtoError<DriverException>> {
+        let result = T::handle_message(
+            "DatabaseDriver",
+            "config_load_all_sections",
+            input.encode_to_vec(),
+        );
+        match result {
+            Ok(output) => {
+                let output = ConfigLoadAllSectionsResponse::decode(&output[..]);
                 match output {
                     Ok(output) => Ok(output),
                     Err(e) => Err(ProtoError::Transport(e.to_string())),
