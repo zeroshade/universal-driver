@@ -9,6 +9,20 @@ import pytest
 from snowflake.connector.errors import NotSupportedError
 
 
+class TestConnectionInfo:
+    """Integration tests for Connection._connection_info property."""
+
+    @pytest.mark.skip_reference
+    def test_connection_info_is_set_after_connect(self, connection):
+        """Test that _connection_info is populated after connection is established."""
+        # Given an established connection
+        # When accessing _connection_info
+        info = connection._connection_info
+
+        # Then it should not be None
+        assert info is not None
+
+
 class TestConnectionMethods:
     """Test Connection object methods."""
 
