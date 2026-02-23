@@ -67,8 +67,20 @@ pub mod driver_error {
         LoginError(super::LoginError),
     }
 }
-/// Driver exception
+/// Single entry in an error trace (analogous to a stack-trace frame)
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ErrorTraceEntry {
+    #[prost(string, tag = "1")]
+    pub file: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub line: u32,
+    #[prost(uint32, tag = "3")]
+    pub column: u32,
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Driver exception
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DriverException {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
@@ -76,8 +88,8 @@ pub struct DriverException {
     pub status_code: i32,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<DriverError>,
-    #[prost(string, tag = "4")]
-    pub report: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub error_trace: ::prost::alloc::vec::Vec<ErrorTraceEntry>,
 }
 /// Column metadata for description
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
