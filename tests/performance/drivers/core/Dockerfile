@@ -42,6 +42,8 @@ RUN apt-get update && apt-get install -y \
     cmake \
     golang-go \
     clang \
+    curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo-chef
@@ -65,6 +67,8 @@ COPY sf_core/ ./sf_core/
 COPY proto_utils/ ./proto_utils/
 COPY error_trace/ ./error_trace/
 COPY error_trace_derive/ ./error_trace_derive/
+COPY proto_generator/ ./proto_generator/
+COPY protobuf/ ./protobuf/
 
 # Modify sf_core/Cargo.toml to only build rlib (not dylib) to avoid linker issues
 RUN sed -i 's/crate-type = \["dylib", "rlib"\]/crate-type = ["rlib"]/' ./sf_core/Cargo.toml
