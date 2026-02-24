@@ -6,7 +6,9 @@ This module defines the Connection class as specified in PEP 249.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Generator, Iterable
+from io import StringIO
+from typing import Any, Union
 
 from snowflake.connector._internal.protobuf_gen.database_driver_v1_services import (
     ConnectionGetInfoRequest,
@@ -22,18 +24,27 @@ from snowflake.connector._internal.protobuf_gen.database_driver_v1_services impo
     DatabaseInitRequest,
     DatabaseNewRequest,
 )
+from snowflake.connector._internal.snowflake_restful import SnowflakeRestful
 
 from ._internal._private_key_helper import normalize_private_key
 from ._internal.api_client.client_api import database_driver_client
 from ._internal.binding_converters import ParamStyle
-from .cursor import SnowflakeCursor, SnowflakeCursorBase
+from ._internal.decorators import backward_compatibility, internal_api
+from ._internal.text_utils import split_statements
+from .cursor import CursorInstance, CursorType, SnowflakeCursor
 from .errors import InterfaceError, NotSupportedError
+from .telemetry import TelemetryClient
+
+
+SessionParameters = dict[str, Any]
+ConnectionParamValue = Union[int, str, float, bytes, SessionParameters]
+ConnectionParameters = dict[str, ConnectionParamValue]
 
 
 class Connection:
     """Connection objects represent a database connection."""
 
-    def __init__(self, *, paramstyle: str | None = None, **kwargs: Any) -> None:
+    def __init__(self, *, paramstyle: str | None = None, **kwargs: ConnectionParamValue) -> None:
         """
         Initialize a new connection object.
 
@@ -53,13 +64,15 @@ class Connection:
 
         self._paramstyle = ParamStyle.from_string(paramstyle or default_paramstyle)
 
+        kwargs = self._rewrite_private_key_password(kwargs)
+
         self.db_api = database_driver_client()
         self.db_handle = self.db_api.database_new(DatabaseNewRequest()).db_handle
         self.db_api.database_init(DatabaseInitRequest(db_handle=self.db_handle))
         self.conn_handle = self.db_api.connection_new(ConnectionNewRequest()).conn_handle
 
         # Extract session_parameters before processing other kwargs
-        session_params = kwargs.pop("session_parameters", None)
+        session_params: SessionParameters | None = kwargs.pop("session_parameters", None)  # type: ignore
 
         # Pre-process private_key if present - normalize for Rust core
         if "private_key" in kwargs:
@@ -93,9 +106,6 @@ class Connection:
             )
 
         self.db_api.connection_init(ConnectionInitRequest(conn_handle=self.conn_handle, db_handle=self.db_handle))
-        self._connection_info: ConnectionGetInfoResponse = self.db_api.connection_get_info(
-            ConnectionGetInfoRequest(conn_handle=self.conn_handle)
-        )
         _sensitive_keys = {"password", "private_key"}
         self.kwargs = {k: ("***" if k in _sensitive_keys else v) for k, v in kwargs.items()}
         self._closed = False
@@ -123,7 +133,7 @@ class Connection:
         """
         raise NotSupportedError("rollback is not implemented")
 
-    def cursor(self, cursor_class: type[SnowflakeCursorBase] = SnowflakeCursor) -> SnowflakeCursorBase:
+    def cursor(self, cursor_class: CursorType = SnowflakeCursor) -> CursorInstance:
         """
         Return a new Cursor object using the connection.
 
@@ -198,11 +208,9 @@ class Connection:
 
         Args:
             autocommit (bool): True to enable autocommit, False to disable
-
-        Raises:
-            NotSupportedError: If not implemented
         """
-        raise NotSupportedError("set_autocommit is not implemented")
+        # TODO: SNOW-3155976 Lacks full implementation
+        self._autocommit = autocommit
 
     def get_autocommit(self) -> bool:
         """
@@ -210,23 +218,10 @@ class Connection:
 
         Returns:
             bool: Current autocommit setting
-
-        Raises:
-            NotSupportedError: If not implemented
         """
-        raise NotSupportedError("get_autocommit is not implemented")
-
-    @property
-    def autocommit(self) -> bool:
-        """
-        Get/set autocommit mode as a property.
-
-        Returns:
-            bool: Current autocommit setting
-        """
+        # TODO: SNOW-3155976 Lacks full implementation
         return self._autocommit
 
-    @autocommit.setter
     def autocommit(self, value: bool) -> None:
         """
         Set autocommit mode.
@@ -235,10 +230,7 @@ class Connection:
             value (bool): Autocommit setting
         """
         self._autocommit = value
-        try:
-            self.set_autocommit(value)
-        except NotSupportedError:
-            pass  # autocommit not supported by implementation
+        self.set_autocommit(value)
 
     def is_closed(self) -> bool:
         """
@@ -271,3 +263,86 @@ class Connection:
             ParamStyle: The paramstyle enum value
         """
         return self._paramstyle
+
+    def execute_string(
+        self,
+        sql_text: str,
+        remove_comments: bool = False,
+        return_cursors: bool = True,
+        cursor_class: CursorType = SnowflakeCursor,
+        **kwargs: Any,
+    ) -> Iterable[CursorInstance]:
+        """Execute a SQL text including multiple statements. This is a non-standard convenience method."""
+        stream = StringIO(sql_text)
+        stream_generator = self.execute_stream(stream, remove_comments=remove_comments, cursor_class=cursor_class)
+        if return_cursors:
+            return list(stream_generator)
+        for _ in stream_generator:
+            pass
+        return []
+
+    def execute_stream(
+        self,
+        stream: StringIO,
+        remove_comments: bool = False,
+        cursor_class: CursorType = SnowflakeCursor,
+        **kwargs: Any,
+    ) -> Generator[CursorInstance, None, None]:
+        """Execute a stream of SQL statements. This is a non-standard convenient method."""
+        for sql, is_put_or_get in split_statements(stream, remove_comments=remove_comments):
+            if not sql:
+                continue
+            cur = self.cursor(cursor_class=cursor_class)
+            cur.execute(sql, _is_put_get=is_put_or_get)
+            yield cur
+
+    @property
+    @internal_api
+    @backward_compatibility
+    def rest(self) -> SnowflakeRestful:
+        return SnowflakeRestful(connection=self)
+
+    @internal_api
+    def _get_connection_info(self) -> ConnectionGetInfoResponse:
+        """Refresh connection details for connection"""
+        return self.db_api.connection_get_info(ConnectionGetInfoRequest(conn_handle=self.conn_handle))
+
+    @internal_api
+    @backward_compatibility
+    def _telemetry(self) -> TelemetryClient:
+        return TelemetryClient()
+
+    @backward_compatibility
+    def _rewrite_private_key_password(self, kwargs: ConnectionParameters) -> ConnectionParameters:
+        private_key_file_pwd = kwargs.pop("private_key_file_pwd", None)
+        if private_key_file_pwd is not None:
+            kwargs = {**kwargs, "private_key_password": private_key_file_pwd}
+        return kwargs
+
+    @property
+    def role(self) -> str | None:
+        return self.kwargs.get("role")  # type: ignore[return-value]
+
+    @property
+    def database(self) -> str | None:
+        # TODO: SNOW-3155976 Read from connection details
+        return self.kwargs.get("database")  # type: ignore[return-value]
+
+    @property
+    def schema(self) -> str | None:
+        # TODO: SNOW-3155976 Read from connection details
+        return self.kwargs.get("schema")  # type: ignore[return-value]
+
+    @property
+    def account(self) -> str | None:
+        # TODO: SNOW-3155976 Read from connection details
+        return self.kwargs.get("account")  # type: ignore[return-value]
+
+    @property
+    def warehouse(self) -> str | None:
+        # TODO: SNOW-3155976 Read from connection details
+        return self.kwargs.get("warehouse")  # type: ignore[return-value]
+
+
+# Backward compatibility alias
+SnowflakeConnection = Connection

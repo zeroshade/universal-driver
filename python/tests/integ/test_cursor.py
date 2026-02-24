@@ -6,16 +6,9 @@ from decimal import Decimal
 
 import pytest
 
+from snowflake.connector.cursor import SnowflakeCursor, SnowflakeCursorBase
 from snowflake.connector.errors import NotSupportedError, ProgrammingError
-from tests.compatibility import IS_UNIVERSAL_DRIVER
 from tests.e2e.types.utils import assert_sequential_values
-
-
-if IS_UNIVERSAL_DRIVER:
-    from snowflake.connector import SnowflakeCursor
-    from snowflake.connector.cursor import SnowflakeCursorBase
-else:
-    from snowflake.connector.cursor import SnowflakeCursor, SnowflakeCursorBase
 
 
 class TestCursorSfqid:
@@ -1059,20 +1052,14 @@ class TestDictCursorCreation:
 
     def test_create_dict_cursor(self, connection):
         """Test that DictCursor can be created via connection.cursor()."""
-        if IS_UNIVERSAL_DRIVER:
-            from snowflake.connector import DictCursor
-        else:
-            from snowflake.connector.cursor import DictCursor
+        from snowflake.connector.cursor import DictCursor
 
         with connection.cursor(DictCursor) as cur:
             assert isinstance(cur, DictCursor)
 
     def test_dict_cursor_is_base_cursor_subclass(self):
         """Test that DictCursor is a subclass of BaseCursor."""
-        if IS_UNIVERSAL_DRIVER:
-            from snowflake.connector import DictCursor
-        else:
-            from snowflake.connector.cursor import DictCursor
+        from snowflake.connector.cursor import DictCursor
 
         assert issubclass(DictCursor, SnowflakeCursorBase)
 
