@@ -180,6 +180,12 @@ pub enum OdbcError {
         location: Location,
     },
 
+    #[snafu(display("SQLFetch cannot be mixed with SQLExtendedFetch without closing cursor"))]
+    ExtendedFetchUsed {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to parse port '{port}'"))]
     InvalidPort {
         port: String,
@@ -372,6 +378,7 @@ impl OdbcError {
             OdbcError::NoMoreData { .. } => SqlState::NoDataFound,
             OdbcError::InvalidCursorPosition { .. } => SqlState::InvalidCursorPosition,
             OdbcError::UnsupportedFeature { .. } => SqlState::OptionalFeatureNotImplemented,
+            OdbcError::ExtendedFetchUsed { .. } => SqlState::FunctionSequenceError,
             OdbcError::InvalidPort { .. } => SqlState::InvalidConnectionStringAttribute,
             OdbcError::SetSqlQuery { .. } => SqlState::SyntaxErrorOrAccessRuleViolation,
             OdbcError::PrepareStatement { .. } => SqlState::SyntaxErrorOrAccessRuleViolation,
@@ -405,11 +412,17 @@ impl OdbcError {
             OdbcError::TextConversionFromUtf16 { .. } => SqlState::StringDataRightTruncated,
             OdbcError::ArrowBinding { .. } => SqlState::GeneralError,
             OdbcError::CoreError {
-                source: CoreProtobufError::Application { error, .. },
+                source: CoreProtobufError::Application { error, message, .. },
                 ..
             } => match error.as_ref() {
                 ErrorType::AuthError(_) => SqlState::InvalidAuthorizationSpecification,
-                ErrorType::GenericError(_) => SqlState::GeneralError,
+                ErrorType::GenericError(_) => {
+                    if message.contains("SQL compilation error") {
+                        SqlState::SyntaxErrorOrAccessRuleViolation
+                    } else {
+                        SqlState::GeneralError
+                    }
+                }
                 ErrorType::InvalidParameterValue(ProtoInvalidParameterValue {
                     parameter, ..
                 }) => {
@@ -426,7 +439,13 @@ impl OdbcError {
                         SqlState::InvalidConnectionStringAttribute
                     }
                 }
-                ErrorType::InternalError(_) => SqlState::GeneralError,
+                ErrorType::InternalError(_) => {
+                    if message.contains("SQL compilation error") {
+                        SqlState::SyntaxErrorOrAccessRuleViolation
+                    } else {
+                        SqlState::GeneralError
+                    }
+                }
                 ErrorType::LoginError(_) => SqlState::InvalidAuthorizationSpecification,
             },
             OdbcError::CoreError { source, .. } => match source {

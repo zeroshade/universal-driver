@@ -1,6 +1,6 @@
 use crate::api::error::{
-    ConversionSnafu, DataNotFetchedSnafu, ExecutionDoneSnafu, FetchDataSnafu,
-    InvalidBufferLengthSnafu, InvalidCursorPositionSnafu, InvalidCursorStateSnafu,
+    ConversionSnafu, DataNotFetchedSnafu, ExecutionDoneSnafu, ExtendedFetchUsedSnafu,
+    FetchDataSnafu, InvalidBufferLengthSnafu, InvalidCursorPositionSnafu, InvalidCursorStateSnafu,
     InvalidDescriptorIndexSnafu, NoMoreDataSnafu, NullPointerSnafu, StatementErrorStateSnafu,
     StatementNotExecutedSnafu, UnsupportedFeatureSnafu,
 };
@@ -106,6 +106,16 @@ fn advance_cursor(state: &mut crate::api::State<StatementState>) -> OdbcResult<(
 pub fn fetch(statement_handle: sql::Handle, warnings: &mut Warnings) -> OdbcResult<()> {
     tracing::debug!("fetch called");
     let stmt = stmt_from_handle(statement_handle);
+
+    if stmt.extended_fetch_used {
+        return ExtendedFetchUsedSnafu.fail();
+    }
+
+    fetch_inner(stmt, warnings)
+}
+
+/// Core fetch logic shared by `fetch` and `extended_fetch`.
+fn fetch_inner(stmt: &mut Statement, warnings: &mut Warnings) -> OdbcResult<()> {
     stmt.get_data_state = None;
 
     let array_size = stmt.ard.array_size.max(1);
@@ -218,20 +228,85 @@ pub fn fetch_scroll(
     fetch(statement_handle, warnings)
 }
 
+/// `SQLExtendedFetch` — deprecated ODBC 2.x function. Only `SQL_FETCH_NEXT` is
+/// supported. Sets `extended_fetch_used` so that subsequent `SQLFetch` calls
+/// return HY010 until the cursor is closed with `SQLFreeStmt(SQL_CLOSE)`.
+pub fn extended_fetch(
+    statement_handle: sql::Handle,
+    fetch_orientation: sql::SmallInt,
+    row_count_ptr: *mut sql::ULen,
+    row_status_ptr: *mut sql::USmallInt,
+    warnings: &mut Warnings,
+) -> OdbcResult<()> {
+    tracing::debug!("extended_fetch called");
+    if fetch_orientation != SQL_FETCH_NEXT {
+        tracing::warn!(
+            "extended_fetch: unsupported orientation {}",
+            fetch_orientation
+        );
+        return UnsupportedFeatureSnafu.fail();
+    }
+
+    let stmt = stmt_from_handle(statement_handle);
+    stmt.extended_fetch_used = true;
+
+    let saved_row_status = stmt.ird.array_status_ptr;
+    let saved_rows_fetched = stmt.ird.rows_processed_ptr;
+
+    if !row_status_ptr.is_null() {
+        stmt.ird.array_status_ptr = row_status_ptr;
+    }
+    if !row_count_ptr.is_null() {
+        stmt.ird.rows_processed_ptr = row_count_ptr;
+    }
+
+    let result = fetch_inner(stmt, warnings);
+
+    stmt.ird.array_status_ptr = saved_row_status;
+    stmt.ird.rows_processed_ptr = saved_rows_fetched;
+
+    result
+}
+
 fn write_row_status(row_status_ptr: *mut u16, row_idx: usize, status: RowStatus) {
     if !row_status_ptr.is_null() {
         unsafe { *row_status_ptr.add(row_idx) = status as u16 };
     }
 }
 
-/// Compute the data stride (in bytes) between successive rows for a column
-/// when using column-wise binding.
-fn column_wise_data_stride(binding: &Binding) -> usize {
-    if binding.buffer_length > 0 {
-        binding.buffer_length as usize
+fn value_stride(binding: &Binding, bind_type: usize) -> usize {
+    if bind_type == 0 {
+        binding
+            .target_type
+            .fixed_size()
+            .unwrap_or(binding.buffer_length as usize)
     } else {
-        binding.target_type.fixed_size().unwrap_or(8)
+        bind_type
     }
+}
+
+fn indicator_or_length_stride(bind_type: usize) -> usize {
+    if bind_type == 0 {
+        std::mem::size_of::<sql::Len>()
+    } else {
+        bind_type
+    }
+}
+
+fn advance_by_element_stride<T>(
+    ptr: *mut T,
+    row_idx: usize,
+    element_stride: usize,
+    bind_offset: isize,
+) -> *mut T {
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let stride = row_idx
+        .checked_mul(element_stride)
+        .expect("row index and element stride multiplication overflowed");
+    let byte_ptr = ptr as *mut u8;
+    unsafe { byte_ptr.offset(bind_offset).add(stride) as *mut T }
 }
 
 /// Create an adjusted `Binding` whose pointers target `row_idx` within the
@@ -243,67 +318,27 @@ fn adjust_binding_for_row(
     bind_type: usize,
     bind_offset: isize,
 ) -> Binding {
-    if row_idx == 0 && bind_offset == 0 {
-        return Binding {
-            target_type: binding.target_type,
-            target_value_ptr: binding.target_value_ptr,
-            buffer_length: binding.buffer_length,
-            str_len_or_ind_ptr: binding.str_len_or_ind_ptr,
-            precision: binding.precision,
-            scale: binding.scale,
-        };
-    }
-
-    let (data_ptr, ind_ptr) = if bind_type == 0 {
-        let stride = column_wise_data_stride(binding);
-        let row_offset = row_idx
-            .checked_mul(stride)
-            .expect("row index and stride multiplication overflowed");
-        let data_ptr = unsafe {
-            (binding.target_value_ptr as *mut u8)
-                .offset(bind_offset)
-                .add(row_offset) as sql::Pointer
-        };
-        let ind_ptr = if !binding.str_len_or_ind_ptr.is_null() {
-            let ind_stride = std::mem::size_of::<sql::Len>();
-            let ind_offset = row_idx
-                .checked_mul(ind_stride)
-                .expect("row index and indicator stride multiplication overflowed");
-            unsafe {
-                (binding.str_len_or_ind_ptr as *mut u8)
-                    .offset(bind_offset)
-                    .add(ind_offset) as *mut sql::Len
-            }
-        } else {
-            std::ptr::null_mut()
-        };
-        (data_ptr, ind_ptr)
-    } else {
-        let row_byte_offset = row_idx
-            .checked_mul(bind_type)
-            .expect("row index and bind type multiplication overflowed");
-        let data_ptr = unsafe {
-            (binding.target_value_ptr as *mut u8)
-                .offset(bind_offset)
-                .add(row_byte_offset) as sql::Pointer
-        };
-        let ind_ptr = if !binding.str_len_or_ind_ptr.is_null() {
-            unsafe {
-                (binding.str_len_or_ind_ptr as *mut u8)
-                    .offset(bind_offset)
-                    .add(row_byte_offset) as *mut sql::Len
-            }
-        } else {
-            std::ptr::null_mut()
-        };
-        (data_ptr, ind_ptr)
-    };
-
     Binding {
         target_type: binding.target_type,
-        target_value_ptr: data_ptr,
+        target_value_ptr: advance_by_element_stride(
+            binding.target_value_ptr,
+            row_idx,
+            value_stride(binding, bind_type),
+            bind_offset,
+        ),
         buffer_length: binding.buffer_length,
-        str_len_or_ind_ptr: ind_ptr,
+        octet_length_ptr: advance_by_element_stride(
+            binding.octet_length_ptr,
+            row_idx,
+            indicator_or_length_stride(bind_type),
+            bind_offset,
+        ),
+        indicator_ptr: advance_by_element_stride(
+            binding.indicator_ptr,
+            row_idx,
+            indicator_or_length_stride(bind_type),
+            bind_offset,
+        ),
         precision: binding.precision,
         scale: binding.scale,
     }
@@ -448,9 +483,9 @@ pub fn get_data(
                 target_type,
                 target_value_ptr,
                 buffer_length,
-                str_len_or_ind_ptr,
-                precision: None,
-                scale: None,
+                octet_length_ptr: str_len_or_ind_ptr,
+                indicator_ptr: str_len_or_ind_ptr,
+                ..Default::default()
             };
             let conversion_warnings =
                 read_arrow_value(&binding, array_ref, field, *batch_idx, &mut offset)
@@ -545,9 +580,8 @@ mod tests {
                 target_type: CDataType::Char,
                 target_value_ptr: buffer.as_mut_ptr() as sql::Pointer,
                 buffer_length: buffer.len() as sql::Len,
-                str_len_or_ind_ptr: &mut str_len,
-                precision: None,
-                scale: None,
+                octet_length_ptr: &mut str_len,
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -567,9 +601,8 @@ mod tests {
                 target_type: CDataType::Char,
                 target_value_ptr: buffer.as_mut_ptr() as sql::Pointer,
                 buffer_length: buffer.len() as sql::Len,
-                str_len_or_ind_ptr: &mut str_len,
-                precision: None,
-                scale: None,
+                octet_length_ptr: &mut str_len,
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -589,14 +622,13 @@ mod tests {
                 target_type: CDataType::Char,
                 target_value_ptr: buffer.as_mut_ptr() as sql::Pointer,
                 buffer_length: buffer.len() as sql::Len,
-                str_len_or_ind_ptr: &mut str_len,
-                precision: None,
-                scale: None,
+                octet_length_ptr: &mut str_len,
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
             assert!(result.is_ok());
-            assert_eq!(str_len, sql::NO_TOTAL); // SQL_NO_TOTAL when truncated
+            assert_eq!(str_len, 11); // total character count of "hello world"
             assert_eq!(&buffer[..4], b"hell"); // Truncated with null terminator at position 4
             assert_eq!(buffer[4], 0); // Null terminator
         }
@@ -616,9 +648,8 @@ mod tests {
                 target_type: CDataType::UBigInt,
                 target_value_ptr: &mut value as *mut UBigInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -636,9 +667,8 @@ mod tests {
                 target_type: CDataType::UBigInt,
                 target_value_ptr: &mut value as *mut UBigInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -658,9 +688,8 @@ mod tests {
                 target_type: CDataType::UBigInt,
                 target_value_ptr: &mut value as *mut UBigInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -683,9 +712,8 @@ mod tests {
                 target_type: CDataType::SBigInt,
                 target_value_ptr: &mut value as *mut SBigInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -703,9 +731,8 @@ mod tests {
                 target_type: CDataType::SBigInt,
                 target_value_ptr: &mut value as *mut SBigInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -728,9 +755,8 @@ mod tests {
                 target_type: CDataType::Long,
                 target_value_ptr: &mut value as *mut sql::Integer as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -748,9 +774,8 @@ mod tests {
                 target_type: CDataType::SLong,
                 target_value_ptr: &mut value as *mut sql::Integer as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -773,9 +798,8 @@ mod tests {
                 target_type: CDataType::ULong,
                 target_value_ptr: &mut value as *mut sql::UInteger as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -798,9 +822,8 @@ mod tests {
                 target_type: CDataType::Short,
                 target_value_ptr: &mut value as *mut sql::SmallInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -818,9 +841,8 @@ mod tests {
                 target_type: CDataType::SShort,
                 target_value_ptr: &mut value as *mut sql::SmallInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -843,9 +865,8 @@ mod tests {
                 target_type: CDataType::UShort,
                 target_value_ptr: &mut value as *mut sql::USmallInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -868,9 +889,8 @@ mod tests {
                 target_type: CDataType::TinyInt,
                 target_value_ptr: &mut value as *mut sql::SChar as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -888,9 +908,8 @@ mod tests {
                 target_type: CDataType::STinyInt,
                 target_value_ptr: &mut value as *mut sql::SChar as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -913,9 +932,8 @@ mod tests {
                 target_type: CDataType::UTinyInt,
                 target_value_ptr: &mut value as *mut sql::Char as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -938,9 +956,8 @@ mod tests {
                 target_type: CDataType::Float,
                 target_value_ptr: &mut value as *mut Real as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -963,9 +980,8 @@ mod tests {
                 target_type: CDataType::Double,
                 target_value_ptr: &mut value as *mut Double as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -985,9 +1001,8 @@ mod tests {
                 target_type: CDataType::Double,
                 target_value_ptr: &mut value as *mut Double as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -1010,9 +1025,8 @@ mod tests {
                 target_type: CDataType::Binary, // Unsupported
                 target_value_ptr: &mut value as *mut i64 as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(),
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -1033,9 +1047,8 @@ mod tests {
                 target_type: CDataType::WChar,
                 target_value_ptr: buffer.as_mut_ptr() as sql::Pointer,
                 buffer_length: (buffer.len() * 2) as sql::Len, // buffer_length is in bytes for WChar
-                str_len_or_ind_ptr: &mut str_len,
-                precision: None,
-                scale: None,
+                octet_length_ptr: &mut str_len,
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -1071,9 +1084,8 @@ mod tests {
                     target_type: CDataType::UBigInt,
                     target_value_ptr: &mut value as *mut UBigInt as sql::Pointer,
                     buffer_length: 0,
-                    str_len_or_ind_ptr: std::ptr::null_mut(),
-                    precision: None,
-                    scale: None,
+                    octet_length_ptr: std::ptr::null_mut(),
+                    ..Default::default()
                 };
                 let result = read_arrow_value(&binding, &array, &field, idx, &mut None);
 
@@ -1095,9 +1107,8 @@ mod tests {
                     target_type: CDataType::Char,
                     target_value_ptr: buffer.as_mut_ptr() as sql::Pointer,
                     buffer_length: buffer.len() as sql::Len,
-                    str_len_or_ind_ptr: &mut str_len,
-                    precision: None,
-                    scale: None,
+                    octet_length_ptr: &mut str_len,
+                    ..Default::default()
                 };
                 let result = read_arrow_value(&binding, &array, &field, idx, &mut None);
 
@@ -1108,7 +1119,7 @@ mod tests {
         }
     }
 
-    // Tests for null str_len_or_ind_ptr
+    // Tests for null octet_length_ptr
     mod null_indicator_tests {
         use super::*;
 
@@ -1122,9 +1133,8 @@ mod tests {
                 target_type: CDataType::UBigInt,
                 target_value_ptr: &mut value as *mut UBigInt as sql::Pointer,
                 buffer_length: 0,
-                str_len_or_ind_ptr: std::ptr::null_mut(), // null indicator
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(), // null indicator
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -1142,9 +1152,8 @@ mod tests {
                 target_type: CDataType::Char,
                 target_value_ptr: buffer.as_mut_ptr() as sql::Pointer,
                 buffer_length: buffer.len() as sql::Len,
-                str_len_or_ind_ptr: std::ptr::null_mut(), // null indicator
-                precision: None,
-                scale: None,
+                octet_length_ptr: std::ptr::null_mut(), // null indicator
+                ..Default::default()
             };
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
 
@@ -1171,9 +1180,10 @@ mod tests {
                 target_type: CDataType::Numeric,
                 target_value_ptr: &mut numeric as *mut sql::Numeric as sql::Pointer,
                 buffer_length: std::mem::size_of::<sql::Numeric>() as sql::Len,
-                str_len_or_ind_ptr: &mut indicator,
+                octet_length_ptr: &mut indicator,
                 precision: Some(10),
                 scale: Some(2),
+                ..Default::default()
             };
 
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
@@ -1201,9 +1211,10 @@ mod tests {
                 target_type: CDataType::Numeric,
                 target_value_ptr: &mut numeric as *mut sql::Numeric as sql::Pointer,
                 buffer_length: std::mem::size_of::<sql::Numeric>() as sql::Len,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
+                octet_length_ptr: std::ptr::null_mut(),
                 precision: Some(5),
                 scale: Some(0),
+                ..Default::default()
             };
 
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
@@ -1234,9 +1245,10 @@ mod tests {
                 target_type: CDataType::Numeric,
                 target_value_ptr: &mut numeric as *mut sql::Numeric as sql::Pointer,
                 buffer_length: std::mem::size_of::<sql::Numeric>() as sql::Len,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
+                octet_length_ptr: std::ptr::null_mut(),
                 precision: Some(10),
                 scale: Some(4),
+                ..Default::default()
             };
 
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);
@@ -1264,9 +1276,10 @@ mod tests {
                 target_type: CDataType::Numeric,
                 target_value_ptr: &mut numeric as *mut sql::Numeric as sql::Pointer,
                 buffer_length: std::mem::size_of::<sql::Numeric>() as sql::Len,
-                str_len_or_ind_ptr: std::ptr::null_mut(),
+                octet_length_ptr: std::ptr::null_mut(),
                 precision: None, // not set
                 scale: Some(0),
+                ..Default::default()
             };
 
             let result = read_arrow_value(&binding, &array, &field, 0, &mut None);

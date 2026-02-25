@@ -55,6 +55,9 @@ pub fn alloc_statement(input_handle: sql::Handle) -> OdbcResult<*mut Statement<'
                 ird: IrdDescriptor::new(),
                 diagnostic_info: DiagnosticInfo::default(),
                 get_data_state: None,
+                cursor_type: crate::api::CursorType::ForwardOnly,
+                max_length: 0,
+                extended_fetch_used: false,
             });
             Ok(Box::into_raw(stmt))
         }
