@@ -607,14 +607,15 @@ impl GherkinValidator {
     }
 
     fn method_name_matches_scenario(&self, method_name: &str, scenario_name: &str) -> bool {
-        use crate::utils::{strings_match_normalized, to_pascal_case, to_snake_case};
+        use crate::utils::{
+            clean_method_name, strings_match_normalized, to_pascal_case, to_snake_case,
+        };
 
-        // Remove test_ prefix for Python test methods
-        let clean_method_name = method_name.trim_start_matches("test_");
+        let clean = clean_method_name(method_name);
 
-        strings_match_normalized(clean_method_name, scenario_name)
-            || strings_match_normalized(clean_method_name, &to_pascal_case(scenario_name))
-            || strings_match_normalized(clean_method_name, &to_snake_case(scenario_name))
+        strings_match_normalized(clean, scenario_name)
+            || strings_match_normalized(clean, &to_pascal_case(scenario_name))
+            || strings_match_normalized(clean, &to_snake_case(scenario_name))
     }
 
     fn determine_orphan_reason(

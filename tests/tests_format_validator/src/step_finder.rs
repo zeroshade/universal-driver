@@ -1,5 +1,5 @@
 use crate::test_discovery::Language;
-use crate::utils::{strings_match_normalized, to_pascal_case, to_snake_case};
+use crate::utils::{clean_method_name, strings_match_normalized, to_pascal_case, to_snake_case};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::Path;
@@ -684,10 +684,11 @@ impl StepFinder {
         // Generate possible function names from scenario name
         let snake_scenario = to_snake_case(scenario_name);
 
-        // Filter methods that match the scenario name
         let matching_methods = all_methods
             .into_iter()
-            .filter(|(method_name, _line)| strings_match_normalized(method_name, &snake_scenario))
+            .filter(|(method_name, _line)| {
+                strings_match_normalized(clean_method_name(method_name), &snake_scenario)
+            })
             .collect();
 
         Ok(matching_methods)
