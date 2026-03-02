@@ -4,6 +4,7 @@ use crate::apis::database_driver_v1::ConnectionInfo;
 use crate::apis::database_driver_v1::Handle;
 use crate::apis::database_driver_v1::Setting;
 use crate::apis::database_driver_v1::error::ConfigError;
+use crate::apis::database_driver_v1::error::ConfigurationSnafu;
 use crate::apis::database_driver_v1::error::RestError;
 use crate::apis::database_driver_v1::statement_bind;
 use crate::apis::database_driver_v1::{BindingType, DataPtr};
@@ -19,12 +20,69 @@ use crate::apis::database_driver_v1::{
     statement_set_option, statement_set_sql_query,
 };
 use crate::config::config_manager;
+use crate::config::path_resolver;
 use crate::protobuf::generated::database_driver_v1::*;
 use arrow::ffi::FFI_ArrowArray;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use error_trace::ErrorTrace;
+use snafu::ResultExt;
 use tracing::instrument;
+
+fn setting_to_json(setting: Setting) -> serde_json::Value {
+    match setting {
+        Setting::String(s) => serde_json::Value::String(s),
+        Setting::Int(i) => serde_json::json!(i),
+        Setting::Double(d) => serde_json::json!(d),
+        Setting::Bool(b) => serde_json::Value::Bool(b),
+        Setting::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(&b).into_owned()),
+    }
+}
+
+/// Convert the flat dot-separated section map from `load_all_config_sections`
+/// into a nested JSON object that Python can consume directly via `json.loads`.
+fn flat_sections_to_nested_json(
+    flat: std::collections::HashMap<String, std::collections::HashMap<String, Setting>>,
+) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+
+    for (section_name, settings) in flat {
+        let settings_map: serde_json::Map<String, serde_json::Value> = settings
+            .into_iter()
+            .map(|(k, v)| (k, setting_to_json(v)))
+            .collect();
+
+        if section_name.is_empty() {
+            for (k, v) in settings_map {
+                root.insert(k, v);
+            }
+            continue;
+        }
+
+        let parts: Vec<&str> = section_name.split('.').collect();
+        let mut current = &mut root;
+        for part in &parts[..parts.len() - 1] {
+            current = current
+                .entry(part.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .expect("intermediate path segment must be an object");
+        }
+
+        let last = parts.last().expect("section_name is non-empty");
+        if let Some(existing) = current.get_mut(*last) {
+            if let Some(obj) = existing.as_object_mut() {
+                for (k, v) in settings_map {
+                    obj.insert(k, v);
+                }
+            }
+        } else {
+            current.insert(last.to_string(), serde_json::Value::Object(settings_map));
+        }
+    }
+
+    serde_json::Value::Object(root)
+}
 
 impl From<ArrowArrayStreamPtr> for *mut FFI_ArrowArrayStream {
     fn from(ptr: ArrowArrayStreamPtr) -> Self {
@@ -819,50 +877,59 @@ impl DatabaseDriver for DatabaseDriverImpl {
         ))
     }
 
-    #[instrument(name = "DatabaseDriverV1::config_load_all_sections", skip(_input))]
+    #[instrument(name = "DatabaseDriverV1::config_load_all_sections", skip(input))]
     fn config_load_all_sections(
-        _input: ConfigLoadAllSectionsRequest,
+        input: ConfigLoadAllSectionsRequest,
     ) -> Result<ConfigLoadAllSectionsResponse, DriverException> {
-        let all_sections = config_manager::load_all_config_sections().map_err(|e| {
-            to_driver_exception(ApiError::Configuration {
-                source: e,
-                location: snafu::Location::new(file!(), line!(), 0),
-            })
+        let all_sections = if input.config_file.is_some() || input.connections_file.is_some() {
+            let paths = path_resolver::ConfigPaths {
+                config_file: input.config_file.map(std::path::PathBuf::from),
+                connections_file: input.connections_file.map(std::path::PathBuf::from),
+            };
+            config_manager::load_all_config_sections_with_paths(&paths)
+        } else {
+            config_manager::load_all_config_sections()
+        }
+        .context(ConfigurationSnafu)
+        .to_protobuf()?;
+
+        let nested_json = flat_sections_to_nested_json(all_sections);
+        let config_json = serde_json::to_string(&nested_json).map_err(|e| DriverException {
+            message: format!("Failed to serialize config to JSON: {e}"),
+            status_code: StatusCode::InternalError as i32,
+            error: None,
+            error_trace: vec![],
         })?;
 
-        let sections = all_sections
-            .into_iter()
-            .map(|(section_name, settings)| {
-                let proto_settings = settings
-                    .into_iter()
-                    .map(|(key, value)| {
-                        let proto_value = match value {
-                            Setting::String(s) => ConfigSetting {
-                                value: Some(config_setting::Value::StringValue(s)),
-                            },
-                            Setting::Int(i) => ConfigSetting {
-                                value: Some(config_setting::Value::IntValue(i)),
-                            },
-                            Setting::Double(d) => ConfigSetting {
-                                value: Some(config_setting::Value::DoubleValue(d)),
-                            },
-                            Setting::Bytes(b) => ConfigSetting {
-                                value: Some(config_setting::Value::BytesValue(b)),
-                            },
-                        };
-                        (key, proto_value)
-                    })
-                    .collect();
-                (
-                    section_name,
-                    ConfigSection {
-                        settings: proto_settings,
-                    },
-                )
-            })
-            .collect();
+        Ok(ConfigLoadAllSectionsResponse { config_json })
+    }
 
-        Ok(ConfigLoadAllSectionsResponse { sections })
+    #[instrument(name = "DatabaseDriverV1::config_get_paths", skip(_input))]
+    fn config_get_paths(
+        _input: ConfigGetPathsRequest,
+    ) -> Result<ConfigGetPathsResponse, DriverException> {
+        let paths = path_resolver::get_config_paths()
+            .context(ConfigurationSnafu)
+            .to_protobuf()?;
+
+        let config_file = paths.config_file.ok_or_else(|| DriverException {
+            message: "Configuration path for config file is unavailable".to_string(),
+            status_code: StatusCode::InternalError as i32,
+            error: None,
+            error_trace: vec![],
+        })?;
+
+        let connections_file = paths.connections_file.ok_or_else(|| DriverException {
+            message: "Configuration path for connections file is unavailable".to_string(),
+            status_code: StatusCode::InternalError as i32,
+            error: None,
+            error_trace: vec![],
+        })?;
+
+        Ok(ConfigGetPathsResponse {
+            config_file: config_file.to_string_lossy().into_owned(),
+            connections_file: connections_file.to_string_lossy().into_owned(),
+        })
     }
 }
 
