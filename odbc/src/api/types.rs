@@ -493,7 +493,9 @@ pub struct ParameterBinding {
 
 pub enum StatementState {
     Created,
-    Prepared,
+    Prepared {
+        reader: ArrowArrayStreamReader,
+    },
     Executed {
         reader: ArrowArrayStreamReader,
         rows_affected: Option<i64>,

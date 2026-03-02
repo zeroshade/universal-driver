@@ -1,7 +1,8 @@
 use crate::api::api_utils::{cstr_to_string, utf16_to_string};
 use crate::api::error::{
     ArrowArrayStreamReaderCreationSnafu, ArrowBindingSnafu, DisconnectedSnafu,
-    InvalidParameterNumberSnafu, Required,
+    InvalidBufferLengthSnafu, InvalidCursorStateSnafu, InvalidHandleSnafu,
+    InvalidParameterNumberSnafu, NoMoreDataSnafu, Required,
 };
 use crate::api::{ConnectionState, OdbcResult, ParameterBinding, StatementState, stmt_from_handle};
 use crate::cdata_types::CDataType;
@@ -13,9 +14,10 @@ use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use odbc_sys as sql;
 use sf_core::protobuf::apis::database_driver_v1::DatabaseDriverClient;
 use sf_core::protobuf::generated::database_driver_v1::{
-    ArrowArrayPtr, ArrowSchemaPtr, ConnectionGetParameterRequest, ConnectionHandle,
-    StatementBindRequest, StatementExecuteQueryRequest, StatementExecuteQueryResponse,
-    StatementPrepareRequest, StatementSetSqlQueryRequest,
+    ArrowArrayPtr, ArrowArrayStreamPtr, ArrowSchemaPtr, ConnectionGetParameterRequest,
+    ConnectionHandle, StatementBindRequest, StatementExecuteQueryRequest,
+    StatementExecuteQueryResponse, StatementHandle, StatementPrepareRequest,
+    StatementSetSqlQueryRequest,
 };
 use snafu::ResultExt;
 use tracing;
@@ -68,6 +70,8 @@ pub fn exec_direct(statement_handle: sql::Handle, statement_text: &str) -> OdbcR
                 stmt_handle: Some(stmt.stmt_handle),
                 query: statement_text.to_string(),
             })?;
+
+            apply_parameter_bindings(&stmt.stmt_handle, &stmt.parameter_bindings)?;
 
             let response =
                 DatabaseDriverClient::statement_execute_query(StatementExecuteQueryRequest {
@@ -126,33 +130,74 @@ fn update_numeric_settings(conn_handle: &ConnectionHandle, settings: &mut Numeri
     }
 }
 
-/// Prepare a SQL statement
-pub fn prepare(
+pub fn prepare_n(
     statement_handle: sql::Handle,
     statement_text: *const sql::Char,
     text_length: sql::Integer,
 ) -> OdbcResult<()> {
+    let query = cstr_to_string(statement_text, text_length)?;
+    prepare(statement_handle, &query)
+}
+
+pub fn prepare_w(
+    statement_handle: sql::Handle,
+    statement_text: *const sql::WChar,
+    text_length: sql::Integer,
+) -> OdbcResult<()> {
+    let query = utf16_to_string(statement_text, text_length)?;
+    prepare(statement_handle, &query)
+}
+
+fn reader_from_protobuf_stream(stream: ArrowArrayStreamPtr) -> OdbcResult<ArrowArrayStreamReader> {
+    let stream_ptr: *mut FFI_ArrowArrayStream = stream.into();
+    let stream = unsafe { FFI_ArrowArrayStream::from_raw(stream_ptr) };
+    let reader =
+        ArrowArrayStreamReader::try_new(stream).context(ArrowArrayStreamReaderCreationSnafu {})?;
+    Ok(reader)
+}
+
+/// Prepare a SQL statement
+pub fn prepare(statement_handle: sql::Handle, query: &str) -> OdbcResult<()> {
+    if statement_handle.is_null() {
+        return InvalidHandleSnafu.fail();
+    }
+    if query.is_empty() {
+        return InvalidBufferLengthSnafu { length: 0i64 }.fail();
+    }
     tracing::debug!("prepare: statement_handle={:?}", statement_handle);
     let stmt = stmt_from_handle(statement_handle);
+
+    if matches!(
+        stmt.state.as_ref(),
+        StatementState::Executed { .. } | StatementState::Fetching { .. } | StatementState::Done
+    ) {
+        tracing::error!("prepare: cursor is already open");
+        return InvalidCursorStateSnafu.fail();
+    }
 
     match &mut stmt.conn.state {
         ConnectionState::Connected {
             db_handle: _,
             conn_handle: _,
         } => {
-            let query = cstr_to_string(statement_text, text_length)?;
-            tracing::debug!("prepare: query = {}", query);
+            tracing::debug!("prepare: query = {query}");
+
             DatabaseDriverClient::statement_set_sql_query(StatementSetSqlQueryRequest {
                 stmt_handle: Some(stmt.stmt_handle),
-                query,
+                query: query.to_string(),
             })?;
 
-            DatabaseDriverClient::statement_prepare(StatementPrepareRequest {
-                stmt_handle: Some(stmt.stmt_handle),
-            })?;
+            let prepare_result =
+                DatabaseDriverClient::statement_prepare(StatementPrepareRequest {
+                    stmt_handle: Some(stmt.stmt_handle),
+                })?;
 
-            stmt.state.set(StatementState::Prepared);
-            stmt.ird.desc_count = 0;
+            let result = prepare_result.result.required("Result is required")?;
+            let stream_ptr = result.stream.required("Stream is required")?;
+            let reader = reader_from_protobuf_stream(stream_ptr)?;
+            stmt.ird.desc_count = reader.schema().fields().len() as sql::SmallInt;
+            stmt.state.set(StatementState::Prepared { reader });
+            tracing::info!("prepare: Successfully prepared statement");
             Ok(())
         }
         ConnectionState::Disconnected => {
@@ -167,32 +212,21 @@ pub fn execute(statement_handle: sql::Handle) -> OdbcResult<()> {
     tracing::debug!("execute: statement_handle={:?}", statement_handle);
     let stmt = stmt_from_handle(statement_handle);
 
+    if matches!(
+        stmt.state.as_ref(),
+        StatementState::Executed { .. } | StatementState::Fetching { .. } | StatementState::Done
+    ) {
+        tracing::error!("execute: cursor is already open");
+        return InvalidCursorStateSnafu.fail();
+    }
+
     match &mut stmt.conn.state {
         ConnectionState::Connected {
             db_handle: _,
             conn_handle,
         } => {
-            // If there are bound parameters, we should bind them to the statement
-            if !stmt.parameter_bindings.is_empty() {
-                tracing::info!(
-                    "execute: Found {} bound parameters",
-                    stmt.parameter_bindings.len()
-                );
+            apply_parameter_bindings(&stmt.stmt_handle, &stmt.parameter_bindings)?;
 
-                let (schema, array) = odbc_bindings_to_arrow_bindings(&stmt.parameter_bindings)
-                    .context(ArrowBindingSnafu {})?;
-
-                // Bind parameters to statement
-                DatabaseDriverClient::statement_bind(StatementBindRequest {
-                    stmt_handle: Some(stmt.stmt_handle),
-                    schema: Some(protobuf_from_ffi_arrow_schema(Box::into_raw(schema))),
-                    array: Some(protobuf_from_ffi_arrow_array(Box::into_raw(array))),
-                })?;
-
-                tracing::info!("Successfully bound parameters");
-            }
-
-            // Execute the prepared statement
             let response =
                 DatabaseDriverClient::statement_execute_query(StatementExecuteQueryRequest {
                     stmt_handle: Some(stmt.stmt_handle),
@@ -201,7 +235,20 @@ pub fn execute(statement_handle: sql::Handle) -> OdbcResult<()> {
 
             tracing::info!("execute: Successfully executed statement");
             update_numeric_settings(conn_handle, &mut stmt.conn.numeric_settings);
-            stmt.state = create_execute_state(response)?.into();
+
+            let statement_type_id = response.result.as_ref().and_then(|r| r.statement_type_id);
+            let rows_affected = response.result.as_ref().and_then(|r| r.rows_affected);
+
+            let execute_state = create_execute_state(response)?;
+
+            // DML that affected 0 rows returns SQL_NO_DATA per ODBC spec.
+            if is_dml_statement_type(statement_type_id) && Some(0) == rows_affected {
+                stmt.state = StatementState::NoResultSet.into();
+                stmt.ird.desc_count = 0;
+                return NoMoreDataSnafu.fail();
+            }
+
+            stmt.state = execute_state.into();
             if let StatementState::Executed { reader, .. } = stmt.state.as_ref() {
                 stmt.ird.desc_count = reader.schema().fields().len() as sql::SmallInt;
             }
@@ -228,6 +275,10 @@ fn is_ddl_statement(statement_type_id: i64) -> bool {
     (0x6000..0x7000).contains(&statement_type_id)
 }
 
+fn is_dml_statement_type(statement_type_id: Option<i64>) -> bool {
+    statement_type_id.is_some_and(|id| (0x3000..0x4000).contains(&id))
+}
+
 fn has_result_set(statement_type_id: i64) -> bool {
     is_ddl_statement(statement_type_id) && !is_pat_statement(statement_type_id)
 }
@@ -235,11 +286,8 @@ fn has_result_set(statement_type_id: i64) -> bool {
 fn create_execute_state(response: StatementExecuteQueryResponse) -> OdbcResult<StatementState> {
     tracing::debug!("create_execute_state: response={:?}", response);
     let result = response.result.required("Execute result is required")?;
-    let stream_ptr: *mut FFI_ArrowArrayStream =
-        result.stream.required("Stream is required")?.into();
-    let stream = unsafe { FFI_ArrowArrayStream::from_raw(stream_ptr) };
-    let reader =
-        ArrowArrayStreamReader::try_new(stream).context(ArrowArrayStreamReaderCreationSnafu {})?;
+    let stream = result.stream.required("Stream is required")?;
+    let reader = reader_from_protobuf_stream(stream)?;
     let rows_affected = result.rows_affected;
     if let Some(statement_type_id) = result.statement_type_id
         && has_result_set(statement_type_id)
@@ -250,6 +298,31 @@ fn create_execute_state(response: StatementExecuteQueryResponse) -> OdbcResult<S
         reader,
         rows_affected,
     })
+}
+
+fn apply_parameter_bindings(
+    stmt_handle: &StatementHandle,
+    parameter_bindings: &std::collections::HashMap<u16, ParameterBinding>,
+) -> OdbcResult<()> {
+    if parameter_bindings.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        "apply_parameter_bindings: Found {} bound parameters",
+        parameter_bindings.len()
+    );
+
+    let (schema, array) =
+        odbc_bindings_to_arrow_bindings(parameter_bindings).context(ArrowBindingSnafu {})?;
+
+    DatabaseDriverClient::statement_bind(StatementBindRequest {
+        stmt_handle: Some(*stmt_handle),
+        schema: Some(protobuf_from_ffi_arrow_schema(Box::into_raw(schema))),
+        array: Some(protobuf_from_ffi_arrow_array(Box::into_raw(array))),
+    })?;
+
+    tracing::info!("apply_parameter_bindings: Successfully bound parameters");
+    Ok(())
 }
 
 /// Bind a parameter to a prepared statement
