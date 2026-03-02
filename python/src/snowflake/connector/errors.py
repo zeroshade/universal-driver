@@ -107,6 +107,10 @@ class MissingConfigOptionError(ConfigSourceError):
 ###### BACK-COMPAT  ######
 
 
+class BadRequest(Error):
+    """Exception for 400 HTTP error for retry."""
+
+
 class ForbiddenError(Error):
     """Exception for 403 HTTP error for retry."""
 
