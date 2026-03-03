@@ -323,6 +323,7 @@ class SnowflakeCursorBase(abc.ABC):
         operation: str,
         parameters: Sequence[Any] | dict[str, Any] | None = None,
         _is_put_get: bool | None = None,
+        **kwargs: Any,
     ) -> SnowflakeCursorBase:
         """
         Execute a database operation (query or command).
