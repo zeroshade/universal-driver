@@ -7,6 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from snowflake.connector._internal.protobuf_gen.database_driver_v1_pb2 import (
+    ConnectionHandle,
+    StatementHandle,
+)
 from snowflake.connector.cursor import SnowflakeCursor, SnowflakeCursorBase
 from snowflake.connector.errors import ProgrammingError
 
@@ -429,6 +433,178 @@ class TestFetchmany:
         assert isinstance(result[0][2], Decimal)
         assert result[0][3] is None
         assert result[1][3] is True
+
+
+class TestStatementLifecycle:
+    """Unit tests for statement handle lifecycle (create/release).
+
+    Each execute() creates a statement handle, runs the query, then
+    releases the handle immediately — the Arrow stream returned by
+    execute is fully owned and does not reference the handle.
+    """
+
+    @pytest.fixture
+    def mock_connection(self):
+        """Create a mock connection with db_api stubs for execute flow."""
+        conn = MagicMock()
+        conn.conn_handle = ConnectionHandle(id=1)
+        conn.is_closed.return_value = False
+        handle_counter = 0
+
+        def new_handle(*_args, **_kwargs):
+            nonlocal handle_counter
+            handle_counter += 1
+            resp = MagicMock()
+            resp.stmt_handle = StatementHandle(id=handle_counter)
+            return resp
+
+        conn.db_api.statement_new.side_effect = new_handle
+        execute_result = MagicMock()
+        execute_result.columns = []
+        execute_result.HasField = MagicMock(return_value=False)
+        conn.db_api.statement_execute_query.return_value.result = execute_result
+        return conn
+
+    @pytest.fixture
+    def cursor(self, mock_connection):
+        """Create a cursor with the mocked connection."""
+        return SnowflakeCursor(mock_connection)
+
+    def test_execute_releases_handle_immediately(self, cursor, mock_connection):
+        """A single execute must release its statement handle before returning."""
+        cursor.execute("SELECT 1")
+
+        mock_connection.db_api.statement_release.assert_called_once()
+        released_id = mock_connection.db_api.statement_release.call_args.args[0].stmt_handle.id
+        assert released_id == 1
+
+    def test_sequential_executes_release_all_handles(self, cursor, mock_connection):
+        """Every execute creates and releases its own handle — nothing leaks."""
+        n = 5
+        for i in range(n):
+            cursor.execute(f"SELECT {i}")
+
+        release = mock_connection.db_api.statement_release
+        assert release.call_count == n
+
+        released_ids = [call.args[0].stmt_handle.id for call in release.call_args_list]
+        assert released_ids == list(range(1, n + 1))
+
+    def test_close_without_execute_does_not_release(self, cursor, mock_connection):
+        """Closing a cursor that never executed should not call release."""
+        cursor.close()
+
+        mock_connection.db_api.statement_release.assert_not_called()
+
+
+class TestSqlstate:
+    """Unit tests for Cursor.sqlstate property."""
+
+    @pytest.fixture
+    def mock_connection(self):
+        conn = MagicMock()
+        conn.conn_handle = ConnectionHandle(id=1)
+        conn.is_closed.return_value = False
+        conn.db_api.statement_new.return_value.stmt_handle = StatementHandle(id=1)
+        return conn
+
+    @pytest.fixture
+    def cursor(self, mock_connection):
+        return SnowflakeCursor(mock_connection)
+
+    def test_sqlstate_none_before_execute(self, cursor):
+        """sqlstate is None on a fresh cursor."""
+        assert cursor.sqlstate is None
+
+    def test_sqlstate_none_after_successful_execute(self, cursor, mock_connection):
+        """sqlstate is None when server returns '00000' (successful completion)."""
+        result = MagicMock()
+        result.columns = []
+        result.sql_state = "00000"
+        mock_connection.db_api.statement_execute_query.return_value.result = result
+
+        cursor.execute("SELECT 1")
+
+        assert cursor.sqlstate is None
+
+    def test_sqlstate_populated_with_error_code(self, cursor, mock_connection):
+        """sqlstate reflects non-success sql_state from execute result."""
+        result = MagicMock()
+        result.columns = []
+        result.sql_state = "42601"
+        mock_connection.db_api.statement_execute_query.return_value.result = result
+
+        cursor.execute("SELECT 1")
+
+        assert cursor.sqlstate == "42601"
+
+    def test_sqlstate_none_when_field_absent(self, cursor, mock_connection):
+        """sqlstate is None when the server does not return sql_state."""
+        result = MagicMock()
+        result.columns = []
+        result.sql_state = ""
+        mock_connection.db_api.statement_execute_query.return_value.result = result
+
+        cursor.execute("SELECT 1")
+
+        assert cursor.sqlstate is None
+
+    def test_sqlstate_updates_on_subsequent_execute(self, cursor, mock_connection):
+        """sqlstate is refreshed on every execute call."""
+        first_result = MagicMock()
+        first_result.columns = []
+        first_result.sql_state = "42601"
+
+        second_result = MagicMock()
+        second_result.columns = []
+        second_result.sql_state = "00000"
+
+        mock_connection.db_api.statement_execute_query.return_value.result = first_result
+        cursor.execute("SELECT 1")
+        assert cursor.sqlstate == "42601"
+
+        mock_connection.db_api.statement_execute_query.return_value.result = second_result
+        cursor.execute("SELECT 2")
+        assert cursor.sqlstate is None
+
+    def test_sqlstate_set_from_error_on_failed_execute(self, cursor, mock_connection):
+        """sqlstate is captured from PEP 249 Error when execute raises."""
+        mock_connection.db_api.statement_execute_query.side_effect = ProgrammingError("error", sqlstate="42601")
+
+        with pytest.raises(ProgrammingError):
+            cursor.execute("INVALID SQL")
+
+        assert cursor.sqlstate == "42601"
+
+    def test_sqlstate_set_to_none_when_error_has_no_sqlstate(self, cursor, mock_connection):
+        """sqlstate is set to None when error carries no sqlstate."""
+        mock_connection.db_api.statement_execute_query.side_effect = ProgrammingError("error", sqlstate=None)
+
+        with pytest.raises(ProgrammingError):
+            cursor.execute("INVALID SQL")
+
+        assert cursor.sqlstate is None
+
+    def test_sqlstate_transitions_across_success_and_failure(self, cursor, mock_connection):
+        """sqlstate updates correctly through None -> error -> None."""
+        success_result = MagicMock()
+        success_result.columns = []
+        success_result.sql_state = "00000"
+
+        mock_connection.db_api.statement_execute_query.return_value.result = success_result
+        mock_connection.db_api.statement_execute_query.side_effect = None
+        cursor.execute("SELECT 1")
+        assert cursor.sqlstate is None
+
+        mock_connection.db_api.statement_execute_query.side_effect = ProgrammingError("error", sqlstate="42601")
+        with pytest.raises(ProgrammingError):
+            cursor.execute("INVALID SQL")
+        assert cursor.sqlstate == "42601"
+
+        mock_connection.db_api.statement_execute_query.side_effect = None
+        mock_connection.db_api.statement_execute_query.return_value.result = success_result
+        cursor.execute("SELECT 2")
+        assert cursor.sqlstate is None
 
 
 class TestFetchmanyArraysizeAttribute:

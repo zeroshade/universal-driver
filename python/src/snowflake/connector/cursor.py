@@ -33,6 +33,7 @@ from ._internal.protobuf_gen.database_driver_v1_pb2 import (
     QueryBindings,
     StatementExecuteQueryRequest,
     StatementNewRequest,
+    StatementReleaseRequest,
     StatementSetSqlQueryRequest,
 )
 from ._internal.type_codes import get_type_code
@@ -109,6 +110,7 @@ class SnowflakeCursorBase(abc.ABC):
         self._description: list[ResultMetadata] | None = None
         self._rowcount: int | None = None
         self._arraysize: int = 1
+        self._sqlstate: str | None = None
         self._closed = False
         # Streaming state for Arrow results
         self._reader = None
@@ -119,7 +121,7 @@ class SnowflakeCursorBase(abc.ABC):
         # Query bindings - keep binding data reference to prevent garbage collection while Rust uses it
         self._binding_data: None | bytes = None
         self._messages: list[tuple[type[Exception], dict[str, str | bool]]] = []
-        self._rownumber: int | None = None
+        self._rownumber: int = -1
         self._errorhandler: Callable
 
     # ------------------------------------------------------------------
@@ -357,15 +359,23 @@ class SnowflakeCursorBase(abc.ABC):
 
         request = StatementExecuteQueryRequest(stmt_handle=stmt_handle, bindings=bindings)
 
-        self.execute_result = self._connection.db_api.statement_execute_query(request).result
+        try:
+            self.execute_result = self._connection.db_api.statement_execute_query(request).result
+        except ProgrammingError as exc:
+            self._sqlstate = exc.sqlstate or None
+            raise
+        finally:
+            self._connection.db_api.statement_release(StatementReleaseRequest(stmt_handle=stmt_handle))
 
         # Reset streaming state for a new result
         self._binding_data = None
         self._iterator = None
+        self._rownumber = -1
 
-        # Populate description and rowcount
+        # Populate description, rowcount, and sqlstate
         self._populate_description()
         self._populate_rowcount()
+        self._populate_sqlstate()
         return self
 
     def _populate_rowcount(self) -> None:
@@ -373,6 +383,15 @@ class SnowflakeCursorBase(abc.ABC):
             self._rowcount = self.execute_result.rows_affected
         else:
             self._rowcount = None
+
+    def _populate_sqlstate(self) -> None:
+        # "00000" (successful completion) is treated as None for
+        # backwards compatibility with the old connector.
+        sql_state = self.execute_result.sql_state if self.execute_result else None
+        if sql_state and sql_state != "00000":
+            self._sqlstate = sql_state
+        else:
+            self._sqlstate = None
 
     @pep249
     def executemany(self, operation: str, seq_of_parameters: Sequence[Sequence[Any] | dict[str, Any]]) -> None:
@@ -506,7 +525,9 @@ class SnowflakeCursorBase(abc.ABC):
         if self._iterator is None:
             self._iterator = self._get_iterator()
         try:
-            return next(self._iterator)
+            row = next(self._iterator)
+            self._rownumber += 1
+            return row
         except StopIteration:
             return None
 
@@ -649,12 +670,12 @@ class SnowflakeCursorBase(abc.ABC):
     @pep249
     def rownumber(self) -> int | None:
         """The current 0-based index of the cursor in the result set, or ``None`` if indeterminate."""
-        return self._rownumber if self._rownumber is not None and self._rownumber >= 0 else None
+        return self._rownumber if self._rownumber >= 0 else None
 
     @property
     def sqlstate(self) -> str | None:
         """The SQLSTATE code of the last executed operation."""
-        raise NotImplementedError("sqlstate is not yet implemented")
+        return self._sqlstate
 
     @property
     def timestamp_output_format(self) -> str | None:

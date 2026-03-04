@@ -443,6 +443,7 @@ fn to_driver_exception(error: ApiError) -> DriverException {
     let message = error.to_string();
     let root_cause = extract_root_cause(&error);
     let driver_error = to_driver_error(&error);
+
     let error_trace = error
         .error_trace()
         .into_iter()
@@ -905,6 +906,7 @@ impl DatabaseDriver for DatabaseDriverImpl {
                     .collect(),
                 statement_type_id: result.statement_type_id,
                 query: result.query,
+                sql_state: result.sql_state,
             }),
         })
     }
