@@ -214,7 +214,7 @@ impl From<ConnectionInfo> for ConnectionGetInfoResponse {
             host: info.host,
             port: info.port,
             server_url: info.server_url,
-            session_token: info.session_token,
+            session_token: info.session_token.map(|t| t.reveal().to_string()),
             session_id: info.session_id,
         }
     }
