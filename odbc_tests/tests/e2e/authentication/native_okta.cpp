@@ -24,7 +24,7 @@ using namespace Catch::Matchers;
 std::string get_okta_connection_string() {
   auto params = get_test_parameters("testconnection");
   std::stringstream ss;
-  ss << "DRIVER=" << get_driver_path() << ";";
+  configure_driver_string(ss);
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_HOST", "SERVER");
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_ACCOUNT", "ACCOUNT");
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_USER", "UID");
@@ -71,11 +71,11 @@ void verify_okta_simple_query_execution(ConnectionHandleWrapper& dbc) {
 
 TEST_CASE("should authenticate using native okta", "[native_okta]") {
   REQUIRE_VPN("Native Okta E2E tests need access to preprod Snowflake account");
+  std::string connection_string = get_okta_connection_string();
 
   // Given Okta authentication is configured with valid credentials
   auto env = setup_okta_environment();
   auto dbc = get_okta_connection_handle(env);
-  std::string connection_string = get_okta_connection_string();
 
   // When Trying to Connect
   attempt_okta_connection(dbc, connection_string);
@@ -92,7 +92,7 @@ TEST_CASE("should fail native okta authentication with wrong credentials", "[nat
   // Given Okta authentication is configured with wrong password
   auto params = get_test_parameters("testconnection");
   std::stringstream ss;
-  ss << "DRIVER=" << get_driver_path() << ";";
+  configure_driver_string(ss);
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_HOST", "SERVER");
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_ACCOUNT", "ACCOUNT");
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_USER", "UID");
@@ -116,7 +116,7 @@ TEST_CASE("should fail native okta authentication with wrong okta url", "[native
   // Given Okta authentication is configured with invalid okta url
   auto params = get_test_parameters("testconnection");
   std::stringstream ss;
-  ss << "DRIVER=" << get_driver_path() << ";";
+  configure_driver_string(ss);
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_HOST", "SERVER");
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_ACCOUNT", "ACCOUNT");
   add_param_required<std::string>(ss, params, "SNOWFLAKE_TEST_OKTA_USER", "UID");

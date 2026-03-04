@@ -7,7 +7,7 @@ name = "sf_core"
 crate-type = ["dylib", "rlib"]
 
 [features]
-default = ["fips", "protobuf"]
+default = ["protobuf"]
 fips = ["rustls/fips"]
 protobuf = ["prost", "proto_utils"]
 
