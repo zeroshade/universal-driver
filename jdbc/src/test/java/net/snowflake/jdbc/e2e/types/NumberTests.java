@@ -13,6 +13,8 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.Statement;
+import java.text.DecimalFormat;
+import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -512,8 +514,21 @@ public class NumberTests extends SnowflakeIntegrationTestBase {
     assertNotNull(stringValue, message + " (getString should not be NULL)");
     assertFalse(stringValue.isEmpty(), message + " (getString should not be empty)");
     assertDoesNotThrow(
-        () -> new BigDecimal(stringValue), message + " (getString should be parseable numeric)");
+        () -> parseLocaleDecimal(stringValue, message),
+        message + " (getString should be parseable numeric)");
     assertFalse(resultSet.wasNull(), message + " (getString should not be NULL)");
+  }
+
+  // It's crucial to have proper local in big decimal comparison
+  private static BigDecimal parseLocaleDecimal(String value, String message) {
+    DecimalFormat df = (DecimalFormat) DecimalFormat.getInstance();
+    df.setParseBigDecimal(true);
+    try {
+      return (BigDecimal) df.parse(value);
+    } catch (ParseException e) {
+      throw new AssertionError(
+          message + " (getString value '" + value + "' is not a parseable number)", e);
+    }
   }
 
   private static BigDecimal toBigDecimal(Object value, String message) {
