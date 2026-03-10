@@ -527,11 +527,7 @@ pub fn get_stmt_attr(
 ) -> OdbcResult<()> {
     use crate::api::StmtAttr;
 
-    tracing::debug!(
-        "get_stmt_attr: statement_handle={:?}, attribute={}",
-        statement_handle,
-        attribute
-    );
+    tracing::debug!("get_stmt_attr: attribute={}", attribute);
 
     let attr = StmtAttr::try_from(attribute)?;
     let stmt = stmt_from_handle(statement_handle);
@@ -572,6 +568,20 @@ pub fn get_stmt_attr(
             let ird_ptr = &mut stmt.ird as *mut crate::api::IrdDescriptor as sql::Handle;
             unsafe {
                 *(value_ptr as *mut sql::Handle) = ird_ptr;
+            }
+            Ok(())
+        }
+        StmtAttr::AppParamDesc => {
+            let apd_ptr = &mut stmt.apd as *mut crate::api::ArdDescriptor as sql::Handle;
+            unsafe {
+                *(value_ptr as *mut sql::Handle) = apd_ptr;
+            }
+            Ok(())
+        }
+        StmtAttr::ImpParamDesc => {
+            let ipd_ptr = &mut stmt.ipd as *mut crate::api::IrdDescriptor as sql::Handle;
+            unsafe {
+                *(value_ptr as *mut sql::Handle) = ipd_ptr;
             }
             Ok(())
         }

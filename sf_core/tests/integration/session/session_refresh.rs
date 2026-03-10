@@ -138,8 +138,7 @@ async fn should_only_refresh_once_with_concurrent_401_errors() {
 
                     Ok(format!("request {} succeeded", i))
                 }
-            })
-            .await
+            }).await
         }));
     }
 
