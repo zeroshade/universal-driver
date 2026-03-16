@@ -2,6 +2,9 @@
 #define COMPATIBILITY_HPP
 
 #include <cstdlib>
+#ifndef _WIN32
+#include <locale>
+#endif
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -11,6 +14,8 @@
 #define GET_PROCESS_ID() _getpid()
 #else
 #include <unistd.h>
+
+#include <cstring>
 #define GET_PROCESS_ID() getpid()
 #endif
 
@@ -18,6 +23,15 @@ enum class DRIVER_TYPE {
   NEW = 0,
   OLD = 1,
 };
+
+enum class PLATFORM {
+  PLATFORM_WINDOWS = 0,
+  PLATFORM_LINUX = 1,
+  PLATFORM_MACOS = 2,
+  PLATFORM_UNKNOWN = 3,
+};
+
+extern PLATFORM get_platform();
 
 extern DRIVER_TYPE get_driver_type();
 
@@ -46,13 +60,18 @@ extern DRIVER_TYPE get_driver_type();
 // re-encodes them to UTF-8 (double-encoding).  SQL_C_BINARY therefore returns
 // different byte sequences than on Unix/Linux where raw UTF-8 is preserved.
 // Use WINDOWS_ONLY / UNIX_ONLY to gate platform-specific assertions.
+#define WINDOWS_ONLY if (get_platform() == PLATFORM::PLATFORM_WINDOWS)
+#define UNIX_ONLY if (get_platform() == PLATFORM::PLATFORM_LINUX || get_platform() == PLATFORM::PLATFORM_MACOS)
+
+inline bool is_ascii_locale() {
 #ifdef _WIN32
-#define WINDOWS_ONLY
-#define UNIX_ONLY if (false)
+  return false;
 #else
-#define WINDOWS_ONLY if (false)
-#define UNIX_ONLY
+  setlocale(LC_CTYPE, "");
+  const char* locale = setlocale(LC_CTYPE, nullptr);
+  return locale != nullptr && (std::string(locale) == "C" || std::string(locale) == "POSIX");
 #endif
+}
 
 #ifdef _WIN32
 #define SKIP_WINDOWS_STRING_ENCODING() \
