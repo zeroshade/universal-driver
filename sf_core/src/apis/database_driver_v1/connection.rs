@@ -9,7 +9,7 @@ use super::global_state::DatabaseDriverV1;
 use super::validation::{ValidationIssue, resolve_and_apply_options};
 use crate::config::ParamStore;
 use crate::config::config_manager;
-use crate::config::param_registry::param_names;
+use crate::config::param_registry::{ParamKey, param_names};
 use crate::config::path_resolver::ConfigPaths;
 use crate::config::rest_parameters::{ClientInfo, LoginParameters};
 use crate::config::retry::RetryPolicy;
@@ -103,6 +103,13 @@ impl DatabaseDriverV1 {
                 let mut merged_params = init_params.unwrap_or_default();
                 merged_params.extend(login_result.session_parameters.unwrap_or_default());
 
+                let login_final_names = FinalSessionNames {
+                    database: login_result.database_name,
+                    schema: login_result.schema_name,
+                    warehouse: login_result.warehouse_name,
+                    role: login_result.role_name,
+                };
+
                 conn_ptr
                     .lock()
                     .map_err(|_| ConnectionLockingSnafu {}.build())?
@@ -112,6 +119,7 @@ impl DatabaseDriverV1 {
                         login_parameters.server_url.clone(),
                         login_parameters.client_info.clone(),
                         merged_params,
+                        login_final_names,
                     );
                 Ok(())
             }
@@ -211,6 +219,9 @@ pub struct Connection {
     pub session_parameters: Arc<RwLock<HashMap<String, String>>>,
     /// Session parameters to send during initialization (set before connection_init)
     pub init_session_parameters: Option<HashMap<String, String>>,
+    /// Server-echoed final names from login and query responses (e.g. after USE DATABASE).
+    /// Stored separately from session_parameters to keep concerns distinct.
+    pub final_session_names: RwLock<FinalSessionNames>,
 }
 
 impl Default for Connection {
@@ -230,6 +241,7 @@ impl Connection {
             client_info: None,
             session_parameters: Arc::new(RwLock::new(HashMap::new())),
             init_session_parameters: None,
+            final_session_names: RwLock::new(FinalSessionNames::default()),
         }
     }
 
@@ -245,6 +257,7 @@ impl Connection {
         server_url: String,
         client_info: ClientInfo,
         session_params: HashMap<String, String>,
+        final_names: FinalSessionNames,
     ) {
         // Use blocking_write since we're in a sync context during connection_init
         *self.tokens.blocking_write() = Some(tokens);
@@ -252,9 +265,12 @@ impl Connection {
         self.server_url = Some(server_url);
         self.client_info = Some(client_info);
 
-        // Populate session parameters cache (assume login always returns parameters)
         if let Ok(mut cache) = self.session_parameters.write() {
             *cache = session_params;
+        }
+
+        if let Ok(mut names) = self.final_session_names.write() {
+            *names = final_names;
         }
     }
 
@@ -265,6 +281,7 @@ impl Connection {
         response_parameters: Option<
             &Vec<crate::rest::snowflake::query_response::NameValueParameter>,
         >,
+        final_names: &FinalSessionNames,
     ) {
         let mut cache = match self.session_parameters.write() {
             Ok(cache) => cache,
@@ -310,6 +327,31 @@ impl Connection {
                     })
                     .filter(|(k, _)| !k.is_empty()),
             );
+        }
+
+        // 3. Server-echoed final names are stored separately in `final_session_names`
+        //    so that conn.database etc. reflect changes from USE DATABASE, USE SCHEMA, etc.
+        match self.final_session_names.write() {
+            Ok(mut names) => {
+                if final_names.database.is_some() {
+                    names.database = final_names.database.clone();
+                }
+                if final_names.schema.is_some() {
+                    names.schema = final_names.schema.clone();
+                }
+                if final_names.warehouse.is_some() {
+                    names.warehouse = final_names.warehouse.clone();
+                }
+                if final_names.role.is_some() {
+                    names.role = final_names.role.clone();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to acquire write lock for final_session_names"
+                );
+            }
         }
     }
 }
@@ -495,6 +537,15 @@ impl RefreshContext {
     }
 }
 
+/// Server-echoed final names from query responses (e.g. after USE DATABASE).
+#[derive(Debug, Clone, Default)]
+pub struct FinalSessionNames {
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub warehouse: Option<String>,
+    pub role: Option<String>,
+}
+
 /// Connection information returned by connection_get_info
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
@@ -508,6 +559,45 @@ pub struct ConnectionInfo {
     pub session_token: Option<SensitiveString>,
     /// The server-assigned session ID
     pub session_id: Option<i64>,
+    /// The Snowflake account name
+    pub account: Option<String>,
+    /// The authenticated user name
+    pub user: Option<String>,
+    /// The current role
+    pub role: Option<String>,
+    /// The current database
+    pub database: Option<String>,
+    /// The current schema
+    pub schema: Option<String>,
+    /// The current warehouse
+    pub warehouse: Option<String>,
+}
+
+fn get_setting_string(conn: &Connection, key: ParamKey) -> Option<String> {
+    conn.settings.get(key).and_then(|s| {
+        if let Setting::String(v) = s {
+            Some(v.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Read a session-level value: check the session parameter cache first (server
+/// may have changed it via USE DATABASE / USE ROLE / etc.), then fall back to
+/// the original connection setting.
+fn get_session_or_setting(
+    conn: &Connection,
+    param_name: &str,
+    setting_key: ParamKey,
+) -> Option<String> {
+    if let Ok(cache) = conn.session_parameters.read()
+        && let Some(v) = cache.get(param_name)
+        && !v.is_empty()
+    {
+        return Some(v.clone());
+    }
+    get_setting_string(conn, setting_key)
 }
 
 impl DatabaseDriverV1 {
@@ -519,14 +609,7 @@ impl DatabaseDriverV1 {
                     .lock()
                     .map_err(|_| ConnectionLockingSnafu {}.build())?;
 
-                // Extract host and port from settings
-                let host = conn.settings.get(param_names::HOST).and_then(|s| {
-                    if let Setting::String(v) = s {
-                        Some(v.clone())
-                    } else {
-                        None
-                    }
-                });
+                let host = get_setting_string(&conn, param_names::HOST);
 
                 let port = conn.settings.get(param_names::PORT).and_then(|s| {
                     if let Setting::Int(v) = s {
@@ -536,10 +619,8 @@ impl DatabaseDriverV1 {
                     }
                 });
 
-                // Get server_url
                 let server_url = conn.server_url.clone();
 
-                // Get session token and session ID from tokens
                 let (session_token, session_id) = {
                     let tokens_guard = conn.tokens.blocking_read();
                     match tokens_guard.as_ref() {
@@ -550,12 +631,50 @@ impl DatabaseDriverV1 {
                     }
                 };
 
+                let account = get_setting_string(&conn, param_names::ACCOUNT);
+                let user = get_setting_string(&conn, param_names::USER);
+
+                // Resolution order for session-scoped values:
+                //   1. final_session_names  (server-echoed via login sessionInfo or query finalXxxName)
+                //   2. session_parameters   (server-returned session params, only pre-login / missing sessionInfo)
+                //   3. connection settings   (original kwargs supplied by the caller)
+                // After a successful login, final_session_names is always populated, so the
+                // or_else branch only fires before connection_init or when the server omits
+                // the field from sessionInfo.
+                let final_names = conn
+                    .final_session_names
+                    .read()
+                    .map_err(|_| ConnectionLockingSnafu {}.build())?;
+                let role = final_names
+                    .role
+                    .clone()
+                    .or_else(|| get_session_or_setting(&conn, "ROLE", param_names::ROLE));
+                let database = final_names
+                    .database
+                    .clone()
+                    .or_else(|| get_session_or_setting(&conn, "DATABASE", param_names::DATABASE));
+                let schema = final_names
+                    .schema
+                    .clone()
+                    .or_else(|| get_session_or_setting(&conn, "SCHEMA", param_names::SCHEMA));
+                let warehouse = final_names
+                    .warehouse
+                    .clone()
+                    .or_else(|| get_session_or_setting(&conn, "WAREHOUSE", param_names::WAREHOUSE));
+                drop(final_names);
+
                 Ok(ConnectionInfo {
                     host,
                     port,
                     server_url,
                     session_token,
                     session_id,
+                    account,
+                    user,
+                    role,
+                    database,
+                    schema,
+                    warehouse,
                 })
             }
             None => InvalidArgumentSnafu {
@@ -589,5 +708,246 @@ impl DatabaseDriverV1 {
             }
             .fail(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apis::database_driver_v1::driver_state;
+    use crate::config::param_registry::param_names;
+
+    fn make_connection_with_settings(settings: Vec<(&str, Setting)>) -> Connection {
+        let mut conn = Connection::new();
+        for (key, value) in settings {
+            conn.settings.insert(key.to_string(), value);
+        }
+        conn
+    }
+
+    #[test]
+    fn get_setting_string_returns_value() {
+        let conn =
+            make_connection_with_settings(vec![("host", Setting::String("example.com".into()))]);
+        assert_eq!(
+            get_setting_string(&conn, param_names::HOST),
+            Some("example.com".into())
+        );
+    }
+
+    #[test]
+    fn get_setting_string_returns_none_for_missing_key() {
+        let conn = Connection::new();
+        assert_eq!(get_setting_string(&conn, param_names::HOST), None);
+    }
+
+    #[test]
+    fn get_setting_string_returns_none_for_non_string_type() {
+        let conn = make_connection_with_settings(vec![("port", Setting::Int(443))]);
+        assert_eq!(get_setting_string(&conn, param_names::PORT), None);
+    }
+
+    #[test]
+    fn get_session_or_setting_prefers_session_parameter() {
+        let conn =
+            make_connection_with_settings(vec![("database", Setting::String("setting_db".into()))]);
+        conn.session_parameters
+            .write()
+            .unwrap()
+            .insert("DATABASE".into(), "session_db".into());
+
+        assert_eq!(
+            get_session_or_setting(&conn, "DATABASE", param_names::DATABASE),
+            Some("session_db".into())
+        );
+    }
+
+    #[test]
+    fn get_session_or_setting_falls_back_to_setting() {
+        let conn =
+            make_connection_with_settings(vec![("database", Setting::String("setting_db".into()))]);
+
+        assert_eq!(
+            get_session_or_setting(&conn, "DATABASE", param_names::DATABASE),
+            Some("setting_db".into())
+        );
+    }
+
+    #[test]
+    fn get_session_or_setting_ignores_empty_session_param() {
+        let conn =
+            make_connection_with_settings(vec![("role", Setting::String("setting_role".into()))]);
+        conn.session_parameters
+            .write()
+            .unwrap()
+            .insert("ROLE".into(), String::new());
+
+        assert_eq!(
+            get_session_or_setting(&conn, "ROLE", param_names::ROLE),
+            Some("setting_role".into())
+        );
+    }
+
+    #[test]
+    fn get_session_or_setting_returns_none_when_both_absent() {
+        let conn = Connection::new();
+        assert_eq!(
+            get_session_or_setting(&conn, "ROLE", param_names::ROLE),
+            None
+        );
+    }
+
+    #[test]
+    fn connection_get_info_returns_all_settings() {
+        let ds = driver_state();
+        let handle = ds.connection_new();
+        ds.connection_set_option(
+            handle,
+            "host".into(),
+            Setting::String("snow.example.com".into()),
+        )
+        .unwrap();
+        ds.connection_set_option(handle, "port".into(), Setting::Int(8080))
+            .unwrap();
+        ds.connection_set_option(
+            handle,
+            "account".into(),
+            Setting::String("my_account".into()),
+        )
+        .unwrap();
+        ds.connection_set_option(handle, "user".into(), Setting::String("my_user".into()))
+            .unwrap();
+        ds.connection_set_option(handle, "role".into(), Setting::String("my_role".into()))
+            .unwrap();
+        ds.connection_set_option(handle, "database".into(), Setting::String("my_db".into()))
+            .unwrap();
+        ds.connection_set_option(handle, "schema".into(), Setting::String("my_schema".into()))
+            .unwrap();
+        ds.connection_set_option(handle, "warehouse".into(), Setting::String("my_wh".into()))
+            .unwrap();
+
+        let info = ds.connection_get_info(handle).unwrap();
+
+        assert_eq!(info.host, Some("snow.example.com".into()));
+        assert_eq!(info.port, Some(8080));
+        assert_eq!(info.account, Some("my_account".into()));
+        assert_eq!(info.user, Some("my_user".into()));
+        assert_eq!(info.role, Some("my_role".into()));
+        assert_eq!(info.database, Some("my_db".into()));
+        assert_eq!(info.schema, Some("my_schema".into()));
+        assert_eq!(info.warehouse, Some("my_wh".into()));
+
+        ds.connection_release(handle).unwrap();
+    }
+
+    #[test]
+    fn connection_get_info_returns_none_for_unset_fields() {
+        let ds = driver_state();
+        let handle = ds.connection_new();
+
+        let info = ds.connection_get_info(handle).unwrap();
+
+        assert_eq!(info.host, None);
+        assert_eq!(info.port, None);
+        assert_eq!(info.account, None);
+        assert_eq!(info.user, None);
+        assert_eq!(info.role, None);
+        assert_eq!(info.database, None);
+        assert_eq!(info.schema, None);
+        assert_eq!(info.warehouse, None);
+        assert!(info.session_token.is_none());
+        assert_eq!(info.session_id, None);
+
+        ds.connection_release(handle).unwrap();
+    }
+
+    #[test]
+    fn connection_get_info_session_params_override_settings() {
+        let ds = driver_state();
+        let handle = ds.connection_new();
+        ds.connection_set_option(
+            handle,
+            "database".into(),
+            Setting::String("original_db".into()),
+        )
+        .unwrap();
+        ds.connection_set_option(
+            handle,
+            "role".into(),
+            Setting::String("original_role".into()),
+        )
+        .unwrap();
+
+        if let Some(conn_ptr) = ds.connections.get_obj(handle) {
+            let conn = conn_ptr.lock().unwrap();
+            conn.session_parameters
+                .write()
+                .unwrap()
+                .insert("DATABASE".into(), "session_db".into());
+            conn.session_parameters
+                .write()
+                .unwrap()
+                .insert("ROLE".into(), "session_role".into());
+        }
+
+        let info = ds.connection_get_info(handle).unwrap();
+
+        assert_eq!(info.database, Some("session_db".into()));
+        assert_eq!(info.role, Some("session_role".into()));
+
+        ds.connection_release(handle).unwrap();
+    }
+
+    #[test]
+    fn connection_get_info_final_names_override_session_params() {
+        let ds = driver_state();
+        let handle = ds.connection_new();
+        ds.connection_set_option(
+            handle,
+            "database".into(),
+            Setting::String("setting_db".into()),
+        )
+        .unwrap();
+
+        if let Some(conn_ptr) = ds.connections.get_obj(handle) {
+            let conn = conn_ptr.lock().unwrap();
+            conn.session_parameters
+                .write()
+                .unwrap()
+                .insert("DATABASE".into(), "session_db".into());
+            conn.final_session_names.write().unwrap().database = Some("final_db".into());
+        }
+
+        let info = ds.connection_get_info(handle).unwrap();
+        assert_eq!(info.database, Some("final_db".into()));
+
+        ds.connection_release(handle).unwrap();
+    }
+
+    #[test]
+    fn update_session_params_cache_stores_final_names_separately() {
+        let conn = Connection::new();
+        let final_names = FinalSessionNames {
+            database: Some("new_db".into()),
+            schema: Some("new_schema".into()),
+            warehouse: None,
+            role: None,
+        };
+
+        conn.update_session_params_cache("SELECT 1", None, &final_names);
+
+        let cache = conn.session_parameters.read().unwrap();
+        assert!(
+            cache.get("DATABASE").is_none(),
+            "final names should not be stored in session_parameters"
+        );
+        assert!(
+            cache.get("SCHEMA").is_none(),
+            "final names should not be stored in session_parameters"
+        );
+
+        let names = conn.final_session_names.read().unwrap();
+        assert_eq!(names.database, Some("new_db".into()));
+        assert_eq!(names.schema, Some("new_schema".into()));
     }
 }
