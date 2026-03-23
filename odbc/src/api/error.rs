@@ -170,12 +170,6 @@ pub enum OdbcError {
         location: Location,
     },
 
-    #[snafu(display("Statement execution is done"))]
-    ExecutionDone {
-        #[snafu(implicit)]
-        location: Location,
-    },
-
     #[snafu(display("No more data available"))]
     NoMoreData {
         #[snafu(implicit)]
@@ -198,6 +192,12 @@ pub enum OdbcError {
 
     #[snafu(display("Optional feature not implemented"))]
     UnsupportedFeature {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Fetch type out of range"))]
+    FetchTypeOutOfRange {
         #[snafu(implicit)]
         location: Location,
     },
@@ -412,11 +412,11 @@ impl OdbcError {
             OdbcError::StatementNotExecuted { .. } => SqlState::FunctionSequenceError,
             OdbcError::InvalidCursorState { .. } => SqlState::InvalidCursorState,
             OdbcError::DataNotFetched { .. } => SqlState::FunctionSequenceError,
-            OdbcError::ExecutionDone { .. } => SqlState::FunctionSequenceError,
             OdbcError::NoMoreData { .. } => SqlState::NoDataFound,
             OdbcError::InvalidCursorPosition { .. } => SqlState::InvalidCursorPosition,
             OdbcError::MixedCursorFunctions { .. } => SqlState::FunctionSequenceError,
             OdbcError::UnsupportedFeature { .. } => SqlState::OptionalFeatureNotImplemented,
+            OdbcError::FetchTypeOutOfRange { .. } => SqlState::FetchTypeOutOfRange,
             OdbcError::ExtendedFetchUsed { .. } => SqlState::FunctionSequenceError,
             OdbcError::InvalidPort { .. } => SqlState::InvalidConnectionStringAttribute,
             OdbcError::SetSqlQuery { .. } => SqlState::SyntaxErrorOrAccessRuleViolation,
