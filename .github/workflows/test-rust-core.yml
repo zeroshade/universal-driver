@@ -104,7 +104,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, macos-latest]
         rust-version: ['stable']
     runs-on: ${{ matrix.os }}
     env:
@@ -112,6 +112,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install Go (required by aws-lc-fips-sys)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
 
       - name: Cache Cargo registry
         uses: actions/cache@v5
