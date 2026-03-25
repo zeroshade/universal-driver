@@ -29,6 +29,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Rust target
+        uses: actions/cache@v5
+        with:
+
+          path: target
+          key: ${{ runner.os }}-rust-odbc-unit-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-odbc-unit-target-
+
       - name: Install dependencies
         run: |
           set -euxo pipefail
@@ -185,6 +205,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Rust target
+        uses: actions/cache@v5
+        with:
+
+          path: target
+          key: ${{ runner.os }}-rust-odbc-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-odbc-target-
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
