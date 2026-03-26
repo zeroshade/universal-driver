@@ -13,12 +13,13 @@ use crate::config::ParamStore;
 use crate::config::config_manager;
 use crate::config::param_registry::{ParamKey, param_names};
 use crate::config::path_resolver::ConfigPaths;
-use crate::config::rest_parameters::{ClientInfo, LoginParameters};
+use crate::config::rest_parameters::{ClientInfo, LoginMethod, LoginParameters};
 use crate::config::retry::RetryPolicy;
 use crate::handle_manager::Handle;
 use crate::rest::snowflake::{self, RestError, SessionTokens, SnowflakeResponseError};
 use crate::sensitive::SensitiveString;
 use crate::tls::client::create_tls_client_with_config;
+use crate::token_cache::TokenCache;
 
 /// Load configuration from TOML files for a named connection.
 ///
@@ -91,10 +92,25 @@ impl DatabaseDriverV1 {
                     create_tls_client_with_config(login_parameters.client_info.tls_config.clone())
                         .context(TlsClientCreationSnafu)?;
 
+                let mfa_caching_requested = matches!(
+                    &login_parameters.login_method,
+                    LoginMethod::UserPasswordMfa {
+                        client_store_temporary_credential: true,
+                        ..
+                    }
+                );
+
+                let token_cache = if mfa_caching_requested {
+                    Some(self.token_cache().context(TokenCacheInitializationSnafu)?)
+                } else {
+                    None
+                };
+
                 let login_result = crate::rest::snowflake::snowflake_login_with_client(
                     &http_client,
                     &login_parameters,
                     init_params.as_ref(),
+                    token_cache.map(|c| c as &dyn TokenCache),
                 )
                 .await
                 .context(LoginSnafu)?;
