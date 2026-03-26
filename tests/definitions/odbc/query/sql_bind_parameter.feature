@@ -129,10 +129,83 @@ Feature: ODBC SQLBindParameter spec compliance
     Then re-executing should return the new string value
 
   # ============================================================================
-  # APD/IPD Descriptor Integration — uncomment in PR #566
+  # APD/IPD Descriptor Integration
   # ============================================================================
 
-  # Scenario: should populate APD descriptor fields after SQLBindParameter.
-  # Scenario: should populate IPD descriptor fields after SQLBindParameter.
-  # Scenario: should report parameter count via SQLNumParams after binding.
-  # Scenario: should describe bound parameter via SQLDescribeParam.
+  @odbc_e2e
+  Scenario: should populate APD descriptor fields after SQLBindParameter.
+    Given Snowflake client is logged in
+    When a char parameter is bound with explicit buffer length and indicator
+    Then the APD record should reflect all bound fields
+    And the APD header should report the correct count
+
+  @odbc_e2e
+  Scenario: should populate IPD descriptor fields after SQLBindParameter.
+    Given Snowflake client is logged in
+    When a decimal parameter is bound with precision and scale
+    Then the IPD record should reflect all bound fields
+    And the IPD header should report the correct count
+
+  @odbc_e2e
+  Scenario: should report parameter count via SQLNumParams after binding.
+    Given Snowflake client is logged in
+    When a statement with two parameter markers is prepared and both are bound
+    Then SQLNumParams should return 2
+
+  @odbc_e2e
+  Scenario: should describe bound parameter via SQLDescribeParam.
+    Given Snowflake client is logged in
+    When a parameterized SELECT is prepared and an integer parameter is bound
+    Then SQLDescribeParam should return the SQL type information
+
+  # ============================================================================
+  # Descriptor Error Scenarios
+  # ============================================================================
+
+  @odbc_e2e
+  Scenario: should return SQL_NO_DATA for unbound APD record.
+    Given Snowflake client is logged in
+    When no parameters are bound and APD record 1 is queried
+    Then SQL_NO_DATA should be returned per ODBC spec
+
+  @odbc_e2e
+  Scenario: should return SQL_NO_DATA for unbound IPD record.
+    Given Snowflake client is logged in
+    When no parameters are bound and IPD record 1 is queried
+    Then the record should not be found (SQL_NO_DATA per spec; old driver returns SQL_ERROR)
+
+  @odbc_e2e
+  Scenario: should return error for negative descriptor record number.
+    Given Snowflake client is logged in
+    When APD is queried with negative record number
+    Then SQL_ERROR should be returned
+
+  @odbc_e2e
+  Scenario: should return error for unknown descriptor field identifier.
+    Given Snowflake client is logged in and a parameter is bound
+    When APD is queried with an unknown field identifier
+    Then SQL_ERROR should be returned
+
+  @odbc_e2e
+  Scenario: should return error for header-only field on record index greater than zero.
+    Given Snowflake client is logged in and a parameter is bound
+    When APD is queried with SQL_DESC_ARRAY_SIZE (header field) on record 1
+    Then SQL_SUCCESS — per ODBC spec, header fields ignore RecNumber
+
+  @odbc_e2e
+  Scenario: should report correct APD and IPD count for multiple parameters.
+    Given Snowflake client is logged in
+    When three parameters are bound
+    Then APD and IPD should both report count 3
+
+  @odbc_e2e
+  Scenario: should reset APD count to zero after SQL_RESET_PARAMS.
+    Given Snowflake client is logged in
+    When a parameter is bound and then bindings are reset
+    Then APD count should be zero
+
+  @odbc_e2e
+  Scenario: should report APD count zero when no parameters are bound.
+    Given Snowflake client is logged in
+    When APD header count is queried before any binding
+    Then count should be 0
