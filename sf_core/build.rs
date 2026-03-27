@@ -15,8 +15,8 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 }
 
 fn generate_protobuf() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let proto_file = normalize_path(
         PathBuf::from(&manifest_dir)
             .join(
@@ -62,8 +62,14 @@ fn main() {
     // Without the DLL bit, test executables remain valid Win32 applications.
     #[cfg(target_os = "windows")]
     {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let def_path = std::path::Path::new(&manifest_dir).join("exports.def");
+        // Rebuild when the export list changes so the DLL export table stays in sync.
+        println!("cargo:rerun-if-changed={}", def_path.display());
+        // No quoting: cargo passes rustc-link-arg as a single OS-level token
+        // (via a response file), so the linker receives the path verbatim.
+        // Adding quotes makes them literal characters in the path, which both
+        // lld-link and MSVC link.exe reject.
         println!("cargo:rustc-link-arg=/DEF:{}", def_path.display());
     }
 
