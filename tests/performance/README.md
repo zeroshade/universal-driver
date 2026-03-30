@@ -119,6 +119,38 @@ hatch run core-local --parameters-json=parameters/parameters_perf_azure.json
 | `--preserve-mappings` | Keep WireMock mappings after tests (for debugging) | `false` (enabled in local runs) |
 | `--reuse-mappings` | Reuse existing mappings directory (e.g., `run_20260115_120000`) | None (runs recording phase) |
 
+### Local Performance Compare
+
+When running locally via `hatch run *-local` scripts, a session summary is printed at the end of the run (after `✓ TESTS COMPLETED`). UD vs OLD comparisons are always shown when both drivers ran. `PERF_LOCAL_COMPARE=1` (set in those scripts) additionally enables comparisons against previous local runs and single-driver summaries.
+
+**What is shown:**
+
+- **UD vs OLD** (when `--driver-type=both`): percentage difference between Universal and Old driver from the current run. Always shown when both drivers ran, regardless of `PERF_LOCAL_COMPARE`.
+- **vs last run** (requires `PERF_LOCAL_COMPARE=1` and at least 1 previous run): current median compared to the previous run's median.
+- **vs all prev** (requires `PERF_LOCAL_COMPARE=1` and at least 2 previous runs): current median compared to the median across all previous runs.
+
+History comparisons are silently skipped when there are no previous runs for `vs last run`, or fewer than 2 previous runs for `vs all prev`.
+
+Metric used: `fetch_s` for SELECT tests, `query_s` for PUT/GET tests. Per-run values use the median over all iterations.
+
+**Session summary format:**
+```
+================================================================================
+SUMMARY
+================================================================================
+
+  select_string_1M_arrow_recorded_http  (python universal)
+    UD vs OLD:    fetch_s  UD=0.327s  OLD=0.459s  UD is -28.7% (faster) than OLD
+    vs last run:  fetch_s  0.459s -> 0.327s  -28.7%  faster  (run_20260326_122102)
+    vs all prev:  fetch_s  median 0.367s -> 0.327s  -10.8%  faster  [N=17]
+
+================================================================================
+```
+
+Previous runs are read from the local `results/` directory. Use `hatch run clean` to reset it.
+
+---
+
 #### Examples with Custom Arguments
 
 ```bash
@@ -176,12 +208,12 @@ def test_with_additional_setup(perf_test):
         ]
     )
 
-from runner.test_types import TestType
+from runner.test_types import PerfTestType
 
 def test_put_files_12mx100(perf_test):
     """PUT/GET test: Upload files to Snowflake stage"""
     perf_test(
-        test_type=TestType.PUT_GET,
+        test_type=PerfTestType.PUT_GET,
         s3_download_url="s3://sfc-eng-data/ecosystem/12Mx100/",
         setup_queries=[
             "CREATE TEMPORARY STAGE put_test_stage"
@@ -196,7 +228,7 @@ def test_put_files_12mx100(perf_test):
 **Notes**: 
 - **SELECT tests**: ARROW format (`ALTER SESSION SET QUERY_RESULT_FORMAT = 'ARROW'`) is added to any provided `setup_queries`.
 - **PUT/GET tests**: `USE DATABASE {database}` is added to any provided `setup_queries`. This is required for `CREATE TEMPORARY STAGE` operations which need a database context.
-- PUT/GET tests use `test_type=TestType.PUT_GET` and measure only the file operation time (no separate fetch phase)
+- PUT/GET tests use `test_type=PerfTestType.PUT_GET` and measure only the file operation time (no separate fetch phase)
 - The `s3_download_url` parameter triggers automatic download of test files from S3 before test execution
 
 ### Test Configuration Priority
