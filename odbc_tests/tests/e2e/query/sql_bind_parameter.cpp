@@ -194,7 +194,53 @@ TEST_CASE("should replace binding when same ParameterNumber is rebound.", "[quer
   CHECK(get_data<SQL_C_LONG>(stmt, 1) == 222);
 }
 
-// TODO: Add 07002 (SQL_RESET_PARAMS) test in PR #566 once auto-IPD is implemented (BD#29).
+TEST_CASE("should fail with 07002 after SQL_RESET_PARAMS clears bindings.", "[query][bind_parameter]") {
+  // Given Snowflake client is logged in
+  Connection conn;
+  auto stmt = conn.createStatement();
+
+  // When a parameterized SELECT is prepared and executed successfully
+  SQLRETURN ret = SQLPrepare(stmt.getHandle(), sqlchar("SELECT ? AS val"), SQL_NTS);
+  REQUIRE_ODBC(ret, stmt);
+  SQLINTEGER param = 42;
+  SQLLEN indicator = 0;
+  ret = SQLBindParameter(stmt.getHandle(), 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &param, 0, &indicator);
+  REQUIRE_ODBC_SUCCESS(ret, stmt);
+  ret = SQLExecute(stmt.getHandle());
+  REQUIRE_ODBC(ret, stmt);
+  ret = SQLCloseCursor(stmt.getHandle());
+  REQUIRE_ODBC(ret, stmt);
+
+  // And all parameter bindings are reset
+  ret = SQLFreeStmt(stmt.getHandle(), SQL_RESET_PARAMS);
+  REQUIRE_ODBC(ret, stmt);
+
+  // Then re-executing should fail with SQLSTATE 07002
+  ret = SQLExecute(stmt.getHandle());
+  REQUIRE_THAT(OdbcResult(ret, stmt), OdbcMatchers::IsError() && OdbcMatchers::HasSqlState("07002"));
+}
+
+TEST_CASE("should fail with 07002 when parameter bindings have a gap.", "[query][bind_parameter]") {
+  // Given Snowflake client is logged in
+  Connection conn;
+  auto stmt = conn.createStatement();
+
+  // When a query with 3 parameter markers is prepared
+  SQLRETURN ret = SQLPrepare(stmt.getHandle(), sqlchar("SELECT ?, ?, ?"), SQL_NTS);
+  REQUIRE_ODBC(ret, stmt);
+
+  // And only parameters 1 and 3 are bound (gap at parameter 2)
+  SQLINTEGER p1 = 1, p3 = 3;
+  SQLLEN ind1 = 0, ind3 = 0;
+  ret = SQLBindParameter(stmt.getHandle(), 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &p1, 0, &ind1);
+  REQUIRE_ODBC_SUCCESS(ret, stmt);
+  ret = SQLBindParameter(stmt.getHandle(), 3, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &p3, 0, &ind3);
+  REQUIRE_ODBC_SUCCESS(ret, stmt);
+
+  // Then executing should fail with SQLSTATE 07002
+  ret = SQLExecute(stmt.getHandle());
+  REQUIRE_THAT(OdbcResult(ret, stmt), OdbcMatchers::IsError() && OdbcMatchers::HasSqlState("07002"));
+}
 
 TEST_CASE("should reflect changed bound variable on re-execution.", "[query][bind_parameter]") {
   // Given Snowflake client is logged in
