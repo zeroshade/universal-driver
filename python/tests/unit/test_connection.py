@@ -596,6 +596,14 @@ class TestApplicationProperty:
             conn = Connection(user="u", account="a", application="")
         assert conn.application == "PythonConnector"
 
+    def test_application_accepts_dotted_name(self, mock_db_api):
+        """Snow CLI passes dotted names like 'SNOWCLI.STAGE.COPY'."""
+        from snowflake.connector.connection import Connection
+
+        with patch("snowflake.connector.connection.database_driver_client", return_value=mock_db_api):
+            conn = Connection(user="u", account="a", application="SNOWCLI.STAGE.COPY")
+        assert conn.application == "SNOWCLI.STAGE.COPY"
+
     def test_application_rejects_non_string(self, mock_db_api):
         from snowflake.connector.connection import Connection
 
@@ -603,12 +611,12 @@ class TestApplicationProperty:
             with pytest.raises(ProgrammingError, match="Invalid application parameter"):
                 Connection(user="u", account="a", application=123)
 
-    def test_application_rejects_invalid_characters(self, mock_db_api):
+    def test_application_rejects_name_starting_with_non_word_char(self, mock_db_api):
         from snowflake.connector.connection import Connection
 
         with patch("snowflake.connector.connection.database_driver_client", return_value=mock_db_api):
             with pytest.raises(ProgrammingError, match="Invalid application name"):
-                Connection(user="u", account="a", application="My App!")
+                Connection(user="u", account="a", application="!invalid")
 
     def test_application_not_in_stored_kwargs(self, mock_db_api):
         """application should be popped from kwargs so it doesn't leak into stored kwargs."""
