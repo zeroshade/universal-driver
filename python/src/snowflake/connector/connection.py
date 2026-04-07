@@ -10,6 +10,7 @@ import logging
 import re
 
 from collections.abc import Generator, Iterable
+from functools import cached_property
 from io import StringIO
 from typing import Any, Callable, Union
 
@@ -38,7 +39,7 @@ from ._internal.binding_converters import ParamStyle
 from ._internal.decorators import backward_compatibility, internal_api, pep249
 from ._internal.text_utils import split_statements
 from .constants import QueryStatus
-from .cursor import CursorInstance, CursorType, SnowflakeCursor
+from .cursor import CursorInstance, CursorType, DictCursor, SnowflakeCursor
 from .errors import Error, InterfaceError, NotSupportedError, ProgrammingError
 from .telemetry import TelemetryClient
 
@@ -619,10 +620,13 @@ class Connection:
         """Whether to cache the IdP token for browser-based SSO authentication."""
         raise NotImplementedError("consent_cache_id_token is not yet implemented")
 
-    @property
+    @cached_property
     def snowflake_version(self) -> str:
         """The current Snowflake server version string."""
-        raise NotImplementedError("snowflake_version is not yet implemented")
+        with self.cursor(DictCursor) as cur:
+            cur.execute("SELECT CURRENT_VERSION() AS version")
+            row: dict[str, Any] = cur.fetchone()  # type: ignore[assignment]
+        return str(row["VERSION"]).split(" ")[0]
 
     def get_query_status(self, sf_qid: str) -> QueryStatus:
         """Retrieve the status of query with sf_qid."""
