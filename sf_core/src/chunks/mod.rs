@@ -284,7 +284,7 @@ pub async fn get_chunk_data(
         &ctx,
         &policy,
         |r| async move { Ok(r) },
-        cancel,
+        cancel.clone(),
     )
     .await
     {
@@ -318,7 +318,11 @@ pub async fn get_chunk_data(
         .fail()?;
     }
 
-    let body = response.bytes().await.context(CommunicationSnafu)?;
+    let body = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return CancelledSnafu.fail(),
+        body = response.bytes() => body.context(CommunicationSnafu)?,
+    };
     let bytes = body.to_vec();
     // gzip inflate is CPU-bound; run it on the blocking pool so a large chunk
     // body doesn't stall this runtime worker.

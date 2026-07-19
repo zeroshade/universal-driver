@@ -467,6 +467,7 @@ where
 
 fn map_http_error(e: HttpError) -> AzureRequestError {
     match e {
+        HttpError::Cancelled { .. } => AzureRequestError::Cancelled,
         HttpError::Transport { source, .. } => AzureRequestError::Http {
             detail: sanitize_sas(source.to_string()),
         },
@@ -710,6 +711,8 @@ enum AzureRequestError {
     MissingMetadata { field: String },
     #[snafu(display("Azure retry exhausted: {detail}"))]
     RetryExhausted { detail: String },
+    #[snafu(display("Operation cancelled"))]
+    Cancelled,
 }
 
 impl From<AzureRequestError> for AzureUploadError {
@@ -728,6 +731,7 @@ impl From<AzureRequestError> for AzureUploadError {
             AzureRequestError::RetryExhausted { detail } => {
                 azure_upload_error::RetryExhaustedSnafu { detail }.build()
             }
+            AzureRequestError::Cancelled => azure_upload_error::CancelledSnafu.build(),
         }
     }
 }
@@ -750,6 +754,7 @@ impl From<AzureRequestError> for AzureDownloadError {
             AzureRequestError::RetryExhausted { detail } => {
                 azure_download_error::RetryExhaustedSnafu { detail }.build()
             }
+            AzureRequestError::Cancelled => azure_download_error::CancelledSnafu.build(),
         }
     }
 }
@@ -799,6 +804,17 @@ pub enum AzureUploadError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation cancelled"))]
+    Cancelled {
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+impl AzureUploadError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, AzureUploadError::Cancelled { .. })
+    }
 }
 
 #[derive(Snafu, Debug, error_trace::ErrorTrace)]
@@ -846,6 +862,17 @@ pub enum AzureDownloadError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation cancelled"))]
+    Cancelled {
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+impl AzureDownloadError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, AzureDownloadError::Cancelled { .. })
+    }
 }
 
 // --- Unit tests ---

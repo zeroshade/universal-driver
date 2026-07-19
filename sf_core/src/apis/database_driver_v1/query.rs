@@ -820,6 +820,17 @@ pub enum QueryResponseProcessingError {
     },
 }
 
+impl QueryResponseProcessingError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        match self {
+            QueryResponseProcessingError::BatchRead { source, .. } => source.is_cancelled(),
+            QueryResponseProcessingError::FileUpload { source, .. } => source.is_cancelled(),
+            QueryResponseProcessingError::FileDownload { source, .. } => source.is_cancelled(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Snafu, error_trace::ErrorTrace)]
 pub enum ReadBatchesError {
     #[snafu(display(
@@ -860,6 +871,12 @@ pub enum ReadBatchesError {
         #[snafu(implicit)]
         location: Location,
     },
+}
+
+impl ReadBatchesError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, ReadBatchesError::ChunkRead { source, .. } if source.is_cancelled())
+    }
 }
 
 #[cfg(test)]

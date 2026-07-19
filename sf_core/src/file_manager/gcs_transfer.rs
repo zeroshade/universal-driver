@@ -803,6 +803,7 @@ where
 
 fn map_http_error(e: HttpError) -> GcsRequestError {
     match e {
+        HttpError::Cancelled { .. } => GcsRequestError::Cancelled,
         HttpError::Transport { source, .. } => GcsRequestError::Http { source },
         other => GcsRequestError::RetryExhausted {
             detail: other.to_string(),
@@ -1215,6 +1216,8 @@ enum GcsRequestError {
     ClientSetup { detail: String },
     #[snafu(display("Failed to serialize GCS metadata"))]
     Serialization { source: serde_json::Error },
+    #[snafu(display("Operation cancelled"))]
+    Cancelled,
 }
 
 impl From<GcsRequestError> for GcsUploadError {
@@ -1243,6 +1246,7 @@ impl From<GcsRequestError> for GcsUploadError {
             GcsRequestError::Serialization { source } => {
                 gcs_upload_error::SerializationSnafu.into_error(source)
             }
+            GcsRequestError::Cancelled => gcs_upload_error::CancelledSnafu.build(),
         }
     }
 }
@@ -1278,6 +1282,7 @@ impl From<GcsRequestError> for GcsDownloadError {
             GcsRequestError::Serialization { source } => {
                 gcs_download_error::DeserializationSnafu.into_error(source)
             }
+            GcsRequestError::Cancelled => gcs_download_error::CancelledSnafu.build(),
         }
     }
 }
@@ -1347,6 +1352,17 @@ pub enum GcsUploadError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation cancelled"))]
+    Cancelled {
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+impl GcsUploadError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, GcsUploadError::Cancelled { .. })
+    }
 }
 
 #[derive(Snafu, Debug, error_trace::ErrorTrace)]
@@ -1428,6 +1444,17 @@ pub enum GcsDownloadError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation cancelled"))]
+    Cancelled {
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+impl GcsDownloadError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, GcsDownloadError::Cancelled { .. })
+    }
 }
 
 // --- Unit tests ---

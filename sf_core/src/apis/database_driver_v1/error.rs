@@ -221,6 +221,7 @@ impl ApiError {
             ApiError::ChunkFetch { source, .. } | ApiError::InlineJsonEncode { source, .. } => {
                 source.is_cancelled()
             }
+            ApiError::QueryResponseProcess { source, .. } => source.is_cancelled(),
             _ => false,
         }
     }

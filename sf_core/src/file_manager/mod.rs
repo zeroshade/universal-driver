@@ -1302,6 +1302,16 @@ impl FileManagerError {
             }
         )
     }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        match self {
+            FileManagerError::GcsUpload { source, .. } => source.is_cancelled(),
+            FileManagerError::GcsDownload { source, .. } => source.is_cancelled(),
+            FileManagerError::AzureUpload { source, .. } => source.is_cancelled(),
+            FileManagerError::AzureDownload { source, .. } => source.is_cancelled(),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
