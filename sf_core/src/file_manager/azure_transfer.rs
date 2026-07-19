@@ -29,6 +29,7 @@ pub async fn upload_to_azure_or_skip(
     overwrite: bool,
     skip_upload_on_content_match: bool,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<UploadStatus, AzureUploadError> {
     let client = create_azure_client(stage_info)?;
     let key = format!("{}{filename}", stage_info.key_prefix);
@@ -36,7 +37,7 @@ pub async fn upload_to_azure_or_skip(
 
     let head_needed = !overwrite || skip_upload_on_content_match;
     let remote = if head_needed {
-        match send_head_to_azure_blob(&client, &url, sas_token, policy).await {
+        match send_head_to_azure_blob(&client, &url, sas_token, policy, cancel.clone()).await {
             Ok(remote) => remote,
             Err(e) if !overwrite => {
                 // Cannot verify whether the blob exists; fail-CLOSED to
@@ -73,7 +74,7 @@ pub async fn upload_to_azure_or_skip(
         SkipDecision::Upload => {}
     }
 
-    upload_to_azure(&client, &url, sas_token, prepared, policy).await?;
+    upload_to_azure(&client, &url, sas_token, prepared, policy, cancel).await?;
     Ok(UploadStatus::Uploaded)
 }
 
@@ -128,6 +129,7 @@ pub async fn download_from_azure(
     stage_info: &StageInfo,
     filename: &str,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<DownloadResponse, AzureDownloadError> {
     let client = create_azure_client(stage_info)?;
     let key = format!("{}{filename}", stage_info.key_prefix);
@@ -136,6 +138,7 @@ pub async fn download_from_azure(
         || client.get(build_sas_url(&url, sas_token.reveal())),
         Method::GET,
         policy,
+        cancel,
     )
     .await?;
 
@@ -210,11 +213,13 @@ async fn send_head_to_azure_blob(
     url: &str,
     sas_token: &SensitiveString,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Option<RemoteBlobHeader>, AzureUploadError> {
     match azure_request_with_retry(
         || client.head(build_sas_url(url, sas_token.reveal())),
         Method::HEAD,
         policy,
+        cancel,
     )
     .await
     {
@@ -255,6 +260,7 @@ async fn upload_to_azure(
     sas_token: &SensitiveString,
     prepared: PreparedUpload,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), AzureUploadError> {
     // `body_for` re-opens the source per retry (a `Path` re-open or an O(1)
     // `Bytes` refcount clone). `prepared` is held until this fn returns, so a
@@ -335,6 +341,7 @@ async fn upload_to_azure(
             Ok(req)
         },
         policy,
+        cancel,
     )
     .await?;
 
@@ -367,15 +374,22 @@ async fn azure_request_with_retry<F>(
     build_request: F,
     method: Method,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<reqwest::Response, AzureRequestError>
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
     let ctx = HttpContext::new(method, "azure-transfer");
 
-    let response = http_execute_with_retry(build_request, &ctx, policy, |r| async move { Ok(r) })
-        .await
-        .map_err(map_http_error)?;
+    let response = http_execute_with_retry(
+        build_request,
+        &ctx,
+        policy,
+        |r| async move { Ok(r) },
+        cancel,
+    )
+    .await
+    .map_err(map_http_error)?;
 
     if response.status().is_success() {
         return Ok(response);
@@ -443,6 +457,7 @@ impl UploadRetryAdapter for AzureUploadRetry {
 async fn azure_upload_with_retry<F>(
     build_request: F,
     policy: &RetryPolicy,
+    _cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), AzureUploadError>
 where
     F: AsyncFn() -> Result<reqwest::RequestBuilder, AzureUploadError>,
@@ -598,6 +613,7 @@ pub async fn download_from_azure_streaming(
     stage_info: &StageInfo,
     filename: &str,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<CloudStreamingDownload, AzureDownloadError> {
     let client = create_azure_client(stage_info)?;
     let key = format!("{}{filename}", stage_info.key_prefix);
@@ -606,6 +622,7 @@ pub async fn download_from_azure_streaming(
         || client.get(build_sas_url(&url, sas_token.reveal())),
         Method::GET,
         policy,
+        cancel,
     )
     .await?;
 
@@ -1208,6 +1225,7 @@ mod tests {
             /* overwrite */ false,
             /* skip_upload_on_content_match */ false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload-or-skip should succeed");
@@ -1241,6 +1259,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -1286,6 +1305,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload-or-skip should succeed");
@@ -1319,6 +1339,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -1349,6 +1370,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -1381,6 +1403,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -1503,6 +1526,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -1559,6 +1583,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(
@@ -1607,6 +1632,7 @@ mod tests {
             true,
             false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -1690,6 +1716,7 @@ mod tests {
             /* overwrite */ false,
             /* skip_upload_on_content_match */ false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("retry should recover and existence skip should fire");
@@ -1720,6 +1747,7 @@ mod tests {
             /* overwrite */ false,
             /* skip_upload_on_content_match */ false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(
@@ -1758,6 +1786,7 @@ mod tests {
             /* overwrite */ true,
             /* skip_upload_on_content_match */ true,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("skip_match path should fail-OPEN to PUT after HEAD retry exhaustion");
@@ -1789,6 +1818,7 @@ mod tests {
             /* overwrite */ false,
             /* skip_upload_on_content_match */ false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(
@@ -1825,6 +1855,7 @@ mod tests {
             /* overwrite */ false,
             /* skip_upload_on_content_match */ false,
             &test_policy(DEFAULT_PUT_GET_MAX_ATTEMPTS),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(

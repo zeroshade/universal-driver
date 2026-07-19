@@ -45,6 +45,7 @@ pub async fn logout_session(
     session_token: &SensitiveString,
     client_info: &ClientInfo,
     retry_policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), RestError> {
     tracing::info!("Initiating session logout");
 
@@ -91,9 +92,13 @@ pub async fn logout_session(
         // NO .timeout() - execute_with_retry applies it dynamically
     };
 
-    let response = execute_with_retry(&build_request, &ctx, retry_policy, |resp| async move {
-        Ok(resp)
-    })
+    let response = execute_with_retry(
+        &build_request,
+        &ctx,
+        retry_policy,
+        |resp| async move { Ok(resp) },
+        cancel,
+    )
     .await
     .map_err(map_http_error)
     .context(AsyncQuerySnafu {

@@ -264,11 +264,14 @@ fn resolve_null_catalog_to_connection_context(
 
     let rt = global().context(OdbcRuntimeSnafu)?;
     let info = rt.block_on(async |c| {
-        c.connection_get_info(ConnectionGetInfoRequest {
-            conn_handle: Some(conn_handle),
-            info_codes: vec![],
-            include_master_token: false,
-        })
+        c.connection_get_info(
+            ConnectionGetInfoRequest {
+                conn_handle: Some(conn_handle),
+                info_codes: vec![],
+                include_master_token: false,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     })?;
 
@@ -432,10 +435,13 @@ fn metadata_request_use_connection_ctx(
 ) -> OdbcResult<bool> {
     let rt = global().context(OdbcRuntimeSnafu)?;
     let resp = rt.block_on(async |c| {
-        c.connection_get_parameter(ConnectionGetParameterRequest {
-            conn_handle: Some(conn_handle),
-            key: "CLIENT_METADATA_REQUEST_USE_CONNECTION_CTX".to_string(),
-        })
+        c.connection_get_parameter(
+            ConnectionGetParameterRequest {
+                conn_handle: Some(conn_handle),
+                key: "CLIENT_METADATA_REQUEST_USE_CONNECTION_CTX".to_string(),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     });
     Ok(resp
@@ -463,11 +469,14 @@ fn resolve_show_identifiers(
 
     let rt = global().context(OdbcRuntimeSnafu)?;
     let info = rt.block_on(async |c| {
-        c.connection_get_info(ConnectionGetInfoRequest {
-            conn_handle: Some(conn_handle),
-            info_codes: vec![],
-            include_master_token: false,
-        })
+        c.connection_get_info(
+            ConnectionGetInfoRequest {
+                conn_handle: Some(conn_handle),
+                info_codes: vec![],
+                include_master_token: false,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     })?;
 
@@ -1568,11 +1577,14 @@ pub fn procedures<E: OdbcEncoding>(
     if catalog_raw.is_none() && metadata_request_use_connection_ctx(conn_handle)? {
         let rt = global().context(OdbcRuntimeSnafu)?;
         let info = rt.block_on(async |c| {
-            c.connection_get_info(ConnectionGetInfoRequest {
-                conn_handle: Some(conn_handle),
-                info_codes: vec![],
-                include_master_token: false,
-            })
+            c.connection_get_info(
+                ConnectionGetInfoRequest {
+                    conn_handle: Some(conn_handle),
+                    info_codes: vec![],
+                    include_master_token: false,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         })?;
         db_name = info.database;
@@ -2237,11 +2249,14 @@ pub fn procedure_columns<E: OdbcEncoding>(
     if catalog_raw.is_none() && metadata_request_use_connection_ctx(conn_handle)? {
         let rt = global().context(OdbcRuntimeSnafu)?;
         let info = rt.block_on(async |c| {
-            c.connection_get_info(ConnectionGetInfoRequest {
-                conn_handle: Some(conn_handle),
-                info_codes: vec![],
-                include_master_token: false,
-            })
+            c.connection_get_info(
+                ConnectionGetInfoRequest {
+                    conn_handle: Some(conn_handle),
+                    info_codes: vec![],
+                    include_master_token: false,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         })?;
         db_name = info.database;
@@ -2308,15 +2323,18 @@ fn execute_get_objects_and_flatten(
     let rt = global().context(OdbcRuntimeSnafu)?;
 
     let response = rt.block_on(async |c| {
-        c.connection_get_objects(ConnectionGetObjectsRequest {
-            conn_handle: Some(conn_handle),
-            depth,
-            catalog,
-            db_schema,
-            table_name,
-            table_type,
-            column_name: None,
-        })
+        c.connection_get_objects(
+            ConnectionGetObjectsRequest {
+                conn_handle: Some(conn_handle),
+                depth,
+                catalog,
+                db_schema,
+                table_name,
+                table_type,
+                column_name: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     })?;
 
@@ -2331,16 +2349,22 @@ fn execute_get_objects_and_flatten(
     // Fetch the Arrow stream from the result set handle
     let stream_ptr = {
         let stream_resp = rt.block_on(async |c| {
-            c.result_set_get_stream(ResultSetGetStreamRequest {
-                result_set_handle: Some(rs_handle),
-            })
+            c.result_set_get_stream(
+                ResultSetGetStreamRequest {
+                    result_set_handle: Some(rs_handle),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         })?;
         // Release is best-effort
         let _ = rt.block_on(async |c| {
-            c.result_set_release(ResultSetReleaseRequest {
-                result_set_handle: Some(rs_handle),
-            })
+            c.result_set_release(
+                ResultSetReleaseRequest {
+                    result_set_handle: Some(rs_handle),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         });
         stream_resp
@@ -2389,15 +2413,18 @@ fn execute_get_columns_and_flatten(
     let rt = global().context(OdbcRuntimeSnafu)?;
 
     let response = rt.block_on(async |c| {
-        c.connection_get_objects(ConnectionGetObjectsRequest {
-            conn_handle: Some(conn_handle),
-            depth: DEPTH_COLUMNS,
-            catalog,
-            db_schema,
-            table_name,
-            table_type: vec![],
-            column_name,
-        })
+        c.connection_get_objects(
+            ConnectionGetObjectsRequest {
+                conn_handle: Some(conn_handle),
+                depth: DEPTH_COLUMNS,
+                catalog,
+                db_schema,
+                table_name,
+                table_type: vec![],
+                column_name,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     })?;
 
@@ -2411,15 +2438,21 @@ fn execute_get_columns_and_flatten(
 
     let stream_ptr = {
         let stream_resp = rt.block_on(async |c| {
-            c.result_set_get_stream(ResultSetGetStreamRequest {
-                result_set_handle: Some(rs_handle),
-            })
+            c.result_set_get_stream(
+                ResultSetGetStreamRequest {
+                    result_set_handle: Some(rs_handle),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         })?;
         let _ = rt.block_on(async |c| {
-            c.result_set_release(ResultSetReleaseRequest {
-                result_set_handle: Some(rs_handle),
-            })
+            c.result_set_release(
+                ResultSetReleaseRequest {
+                    result_set_handle: Some(rs_handle),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         });
         stream_resp

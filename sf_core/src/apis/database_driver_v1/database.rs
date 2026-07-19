@@ -68,6 +68,7 @@ impl DatabaseDriverV1 {
         input: FetchChunkInput,
         format: ChunkFormatKind,
         row_types: Vec<RowType>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Box<FFI_ArrowArrayStream>, ApiError> {
         let bytes = match input {
             FetchChunkInput::Inline(data) => BASE64.decode(&data).context(Base64DecodeSnafu)?,
@@ -91,7 +92,7 @@ impl DatabaseDriverV1 {
                     )
                     .context(TlsClientCreationSnafu)?,
                 };
-                get_chunk_data(client, chunk)
+                get_chunk_data(client, chunk, cancel)
                     .await
                     .context(ChunkFetchSnafu)?
             }

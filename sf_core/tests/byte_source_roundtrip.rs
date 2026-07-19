@@ -254,6 +254,7 @@ async fn download_single_file_tampered_digest_leaves_no_output() {
         &RetryPolicy::put_get(&ParamStore::new()),
         0,
         &mut None,
+        tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -396,6 +397,7 @@ async fn streaming_roundtrip_for(cloud: Cloud) {
                 ),
                 0,
                 &mut None,
+                tokio_util::sync::CancellationToken::new(),
             )
             .await
             .expect("GCS streaming download must succeed")
@@ -429,6 +431,7 @@ async fn streaming_roundtrip_for(cloud: Cloud) {
                     max_attempts: DEFAULT_PUT_GET_MAX_ATTEMPTS,
                     ..RetryPolicy::default()
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await
             .expect("Azure streaming download must succeed")
@@ -559,6 +562,7 @@ async fn gcs_streaming_mid_body_disconnect_surfaces_error() {
             ),
             0,
             &mut None,
+            tokio_util::sync::CancellationToken::new(),
         ),
     )
     .await

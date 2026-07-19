@@ -221,7 +221,10 @@ pub(super) fn prepare_logout_from_conn(
 /// Uses `RefreshContext::execute_with_refresh` — the shared refresh-retry loop.
 /// Calls `execute_with_refresh` directly (not `with_valid_session`) because logout
 /// uses `RefreshContext::new()` (no `is_closed` check — logout runs after close).
-pub(super) async fn send_logout_request(data: LogoutData) -> Result<(), ApiError> {
+pub(super) async fn send_logout_request(
+    data: LogoutData,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), ApiError> {
     let mut ctx = data.refresh_ctx;
 
     let result = ctx
@@ -230,7 +233,8 @@ pub(super) async fn send_logout_request(data: LogoutData) -> Result<(), ApiError
             let url = &data.url;
             let info = &data.info;
             let retry_policy = &data.retry_policy;
-            async move { logout_session(client, url, &token, info, retry_policy).await }
+            let cancel = cancel.clone();
+            async move { logout_session(client, url, &token, info, retry_policy, cancel).await }
         })
         .await;
 
@@ -255,10 +259,11 @@ pub(super) async fn send_logout_request(data: LogoutData) -> Result<(), ApiError
 pub(super) async fn execute_logout_with_strategy(
     logout_data: Option<LogoutData>,
     error_strategy: crate::config::logout::ErrorStrategy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), ApiError> {
     let logout_result = match logout_data {
         Some(data) => {
-            let result = send_logout_request(data).await;
+            let result = send_logout_request(data, cancel).await;
             if result.is_ok() {
                 tracing::info!("Logout completed successfully");
             }

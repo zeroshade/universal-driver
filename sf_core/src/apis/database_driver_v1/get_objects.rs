@@ -204,6 +204,7 @@ impl DatabaseDriverV1 {
     pub async fn connection_get_objects(
         &self,
         req: GetObjectsRequest,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<super::result_set::ResultSetInfo, ApiError> {
         let conn_ptr = self
             .connections
@@ -221,12 +222,15 @@ impl DatabaseDriverV1 {
         // explicitly; reject COLUMNS (deferred) and unknown values rather than
         // letting them fall through to a TABLES catch-all.
         let batch = match req.depth {
-            DEPTH_CATALOGS => fetch_catalogs(&conn_ptr, catalog_filter.as_deref()).await?,
+            DEPTH_CATALOGS => {
+                fetch_catalogs(&conn_ptr, catalog_filter.as_deref(), cancel.clone()).await?
+            }
             DEPTH_DB_SCHEMAS => {
                 fetch_schemas(
                     &conn_ptr,
                     catalog_filter.as_deref(),
                     schema_filter.as_deref(),
+                    cancel.clone(),
                 )
                 .await?
             }
@@ -238,6 +242,7 @@ impl DatabaseDriverV1 {
                     schema_filter.as_deref(),
                     req.table_name.as_deref(),
                     &table_types,
+                    cancel.clone(),
                 )
                 .await?
             }
@@ -248,6 +253,7 @@ impl DatabaseDriverV1 {
                     schema_filter.as_deref(),
                     req.table_name.as_deref(),
                     req.column_name.as_deref(),
+                    cancel,
                 )
                 .await?
             }
@@ -307,9 +313,10 @@ async fn apply_connection_context(
 async fn fetch_catalogs(
     conn_ptr: &Arc<Mutex<Connection>>,
     catalog_filter: Option<&str>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<RecordBatch, ApiError> {
     let sql = "SHOW DATABASES IN ACCOUNT".to_string();
-    let rows = execute_show(conn_ptr, &sql).await?;
+    let rows = execute_show(conn_ptr, &sql, cancel).await?;
 
     let catalog_names: Vec<Option<String>> = rows
         .iter()
@@ -335,6 +342,7 @@ async fn fetch_schemas(
     conn_ptr: &Arc<Mutex<Connection>>,
     catalog_filter: Option<&str>,
     schema_filter: Option<&str>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<RecordBatch, ApiError> {
     // Pick tightest scope: exact catalog -> IN DATABASE "db", else IN ACCOUNT
     let sql = if let Some(pattern) = catalog_filter {
@@ -351,7 +359,7 @@ async fn fetch_schemas(
         "SHOW SCHEMAS IN ACCOUNT".to_string()
     };
 
-    let rows = execute_show(conn_ptr, &sql).await?;
+    let rows = execute_show(conn_ptr, &sql, cancel).await?;
 
     let mut by_catalog: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
@@ -421,6 +429,7 @@ async fn fetch_tables(
     schema_filter: Option<&str>,
     table_name_filter: Option<&str>,
     table_types: &TableTypeFilter,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<RecordBatch, ApiError> {
     if matches!(table_types, TableTypeFilter::Unsupported) {
         return build_tables_batch(BTreeMap::new());
@@ -453,6 +462,7 @@ async fn fetch_tables(
     let rows = execute_show(
         conn_ptr,
         &format_show_sql("SHOW OBJECTS", &like_clause, &scope),
+        cancel,
     )
     .await?;
 
@@ -575,6 +585,7 @@ fn map_execute_show_error(
 async fn execute_show(
     conn_ptr: &Arc<Mutex<Connection>>,
     sql: &str,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<Vec<(String, String)>>, ApiError> {
     let (query_parameters, http_client, retry_policy, prefetch_config) = {
         let conn = conn_ptr.lock().await;
@@ -603,6 +614,7 @@ async fn execute_show(
         let query_parameters = query_parameters.clone();
         let query_input = query_input.clone();
         let retry_policy = retry_policy.clone();
+        let cancel = cancel.clone();
         async move {
             snowflake_query_with_client(
                 &http_client,
@@ -611,6 +623,7 @@ async fn execute_show(
                 query_input,
                 &retry_policy,
                 QueryExecutionMode::Blocking,
+                cancel,
             )
             .await
         }
@@ -629,14 +642,15 @@ async fn execute_show(
     // Account-wide `SHOW OBJECTS` spills to external chunks; parsing only the
     // inline rowset here would silently drop most rows.
     let rowset_data = response.data.into_rowset_data();
-    let reader = super::query::read_batches(&rowset_data, http_client, &prefetch_config, None)
-        .await
-        .map_err(|e| {
-            InvalidArgumentSnafu {
-                argument: format!("SHOW result read failed: {e}"),
-            }
-            .build()
-        })?;
+    let reader =
+        super::query::read_batches(&rowset_data, http_client, &prefetch_config, None, cancel)
+            .await
+            .map_err(|e| {
+                InvalidArgumentSnafu {
+                    argument: format!("SHOW result read failed: {e}"),
+                }
+                .build()
+            })?;
     // The reader drains chunks via `blocking_recv`, which panics if polled on a
     // runtime worker; drain it on a blocking thread while downloads progress on
     // the async workers.
@@ -1123,6 +1137,7 @@ async fn fetch_columns(
     schema_filter: Option<&str>,
     table_name_filter: Option<&str>,
     column_name_filter: Option<&str>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<RecordBatch, ApiError> {
     // Empty string means "match nothing".
     if matches!(table_name_filter, Some("")) || matches!(column_name_filter, Some("")) {
@@ -1158,7 +1173,7 @@ async fn fetch_columns(
     };
 
     let sql = format_show_sql("SHOW COLUMNS", &col_like_clause, &scope);
-    let rows = execute_show(conn_ptr, &sql).await?;
+    let rows = execute_show(conn_ptr, &sql, cancel).await?;
 
     // Group columns by (catalog, schema, table), preserving SHOW row order for
     // ordinal_position assignment. BTreeMap gives deterministic lexicographic sort.

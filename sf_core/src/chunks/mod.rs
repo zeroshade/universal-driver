@@ -72,6 +72,7 @@ pub async fn json_prefetch_reader(
     chunk_download_data: Vec<ChunkDownloadData>,
     client: Client,
     config: &PrefetchConfig,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Box<dyn RecordBatchReader + Send>, ChunkError> {
     let initial_reader = convert_string_rowset_to_arrow_reader(initial_rowset, &row_types)?;
     let downloader = HttpChunkDownloader { client };
@@ -84,6 +85,7 @@ pub async fn json_prefetch_reader(
         downloader,
         parser,
         config,
+        cancel,
     )
     .await
 }
@@ -94,6 +96,7 @@ pub async fn arrow_prefetch_reader(
     client: Client,
     config: &PrefetchConfig,
     nullable_flags: Option<&[bool]>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Box<dyn RecordBatchReader + Send>, ChunkError> {
     let initial_reader = if let Some(initial_base64) = initial_base64_opt {
         let bytes = BASE64.decode(initial_base64).context(Base64DecodeSnafu)?;
@@ -103,7 +106,7 @@ pub async fn arrow_prefetch_reader(
         let first = chunk_download_data
             .pop_front()
             .context(MissingInitialChunkSnafu)?;
-        let bytes = get_chunk_data(client.clone(), first).await?;
+        let bytes = get_chunk_data(client.clone(), first, cancel.clone()).await?;
         let cursor = io::Cursor::new(bytes);
         StreamReader::try_new(cursor, None).context(ChunkReadSnafu)?
     };
@@ -115,6 +118,7 @@ pub async fn arrow_prefetch_reader(
         downloader,
         parser,
         config,
+        cancel,
     )
     .await?;
     Ok(maybe_inject_nullable(reader, nullable_flags))
@@ -259,6 +263,7 @@ pub struct InitialChunkData {
 pub async fn get_chunk_data(
     client: Client,
     chunk: ChunkDownloadData,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<u8>, ChunkError> {
     let url = &chunk.url;
     let mut headers = HeaderMap::new();
@@ -279,6 +284,7 @@ pub async fn get_chunk_data(
         &ctx,
         &policy,
         |r| async move { Ok(r) },
+        cancel,
     )
     .await
     {
@@ -300,6 +306,7 @@ pub async fn get_chunk_data(
                     status: reqwest::StatusCode::PAYLOAD_TOO_LARGE,
                 }
                 .fail(),
+                HttpError::Cancelled { .. } => CancelledSnafu.fail(),
             };
         }
     };

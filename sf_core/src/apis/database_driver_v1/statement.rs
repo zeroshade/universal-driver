@@ -204,11 +204,15 @@ pub struct PrepareResult {
 }
 
 impl DatabaseDriverV1 {
-    pub async fn statement_prepare(&self, stmt_handle: Handle) -> Result<PrepareResult, ApiError> {
+    pub async fn statement_prepare(
+        &self,
+        stmt_handle: Handle,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<PrepareResult, ApiError> {
         let session_id = self.session_id_for_stmt(stmt_handle).await;
         async {
             let result = self
-                .execute_query_internal(stmt_handle, None, Some(true), None)
+                .execute_query_internal(stmt_handle, None, Some(true), None, cancel.clone())
                 .await?;
 
             // Multi-statement query prepare is not supported.
@@ -218,7 +222,7 @@ impl DatabaseDriverV1 {
                 }
                 .fail();
             };
-            let stream = self.result_set_get_stream(rs_info.handle).await?;
+            let stream = self.result_set_get_stream(rs_info.handle, cancel).await?;
             self.result_set_release(rs_info.handle)?;
 
             let stmt_ptr =
@@ -254,9 +258,10 @@ impl DatabaseDriverV1 {
         stmt_handle: Handle,
         bindings: Option<BindingType<'a>>,
         timeout_seconds: Option<u32>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ExecuteQueryResult, ApiError> {
         let session_id = self.session_id_for_stmt(stmt_handle).await;
-        self.execute_query_internal(stmt_handle, bindings, None, timeout_seconds)
+        self.execute_query_internal(stmt_handle, bindings, None, timeout_seconds, cancel)
             .instrument(crate::snowflake_op_span!(
                 "statement_execute_query",
                 session_id
@@ -271,6 +276,7 @@ impl DatabaseDriverV1 {
         query_parameters: &QueryParameters,
         retry_policy: &RetryPolicy,
         csv_bytes: &[u8],
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<String, ApiError> {
         let (use_s3_regional_url_session_param, flags, put_get_policy) = {
             let conn = conn_arc.lock().await;
@@ -294,7 +300,7 @@ impl DatabaseDriverV1 {
             use_s3_regional_url_session_param,
         };
         let request_id = uuid::Uuid::new_v4();
-        crate::stage_binding::upload_csv_bindings(&stage_ctx, &flags, request_id, csv_bytes)
+        crate::stage_binding::upload_csv_bindings(&stage_ctx, &flags, request_id, csv_bytes, cancel)
             .await
             .context(StageBindingSnafu)
     }
@@ -305,6 +311,7 @@ impl DatabaseDriverV1 {
         bindings: Option<BindingType<'a>>,
         describe_only: Option<bool>,
         timeout_seconds: Option<u32>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ExecuteQueryResult, ApiError> {
         let stmt_ptr =
             self.statements
@@ -336,6 +343,7 @@ impl DatabaseDriverV1 {
                     &query_parameters,
                     &retry_policy,
                     bytes,
+                    cancel.clone(),
                 )
                 .await?;
             inject_timestamp_input_format_auto(&mut query_parameter_map);
@@ -372,6 +380,7 @@ impl DatabaseDriverV1 {
                     query_input.clone(),
                     &retry_policy,
                     execution_mode,
+                    cancel.clone(),
                 );
                 let result = if let Some((budget, deadline)) = query_deadline {
                     match tokio::time::timeout_at(deadline, query_call).await {
@@ -423,6 +432,7 @@ impl DatabaseDriverV1 {
                 data,
                 Some((query, query_parameters)),
                 skip_upload_on_content_match,
+                cancel,
             )
             .await?;
         let reader_ctx = resolve_reader_ctx(&conn_arc).await?;
@@ -442,6 +452,7 @@ impl DatabaseDriverV1 {
         data: query_response::Data,
         refresh_sql: Option<(String, QueryParameters)>,
         skip_upload_on_content_match: bool,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<query_response::RowsetData, ApiError> {
         match data.command.as_deref() {
             Some(command) => {
@@ -452,6 +463,7 @@ impl DatabaseDriverV1 {
                         sql,
                         query_parameters,
                         conn: conn.clone(),
+                        cancel: cancel.clone(),
                     });
                 // Late-bind connection params so post-init `set_option`
                 // overrides take effect (mirrors `LogoutConfig`).
@@ -480,6 +492,7 @@ impl DatabaseDriverV1 {
                     unsafe_file_write,
                     tls_config,
                     self.crl_worker.clone(),
+                    cancel,
                 )
                 .await
                 .context(QueryResponseProcessSnafu)
@@ -493,6 +506,7 @@ impl DatabaseDriverV1 {
         &self,
         stmt_handle: Handle,
         bindings: Option<BindingType<'a>>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<AsyncExecuteResult, ApiError> {
         let stmt_ptr =
             self.statements
@@ -518,6 +532,7 @@ impl DatabaseDriverV1 {
                     &query_parameters,
                     &retry_policy,
                     bytes,
+                    cancel.clone(),
                 )
                 .await?;
             inject_timestamp_input_format_auto(&mut query_parameter_map);
@@ -547,6 +562,7 @@ impl DatabaseDriverV1 {
                     &query_input,
                     request_id,
                     &retry_policy,
+                    cancel.clone(),
                 )
                 .await
                 {
@@ -576,6 +592,7 @@ impl DatabaseDriverV1 {
         &self,
         conn_handle: Handle,
         query_id: String,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ExecuteQueryResult, ApiError> {
         let session_id = self.session_id_for_conn(conn_handle).await;
         async {
@@ -585,7 +602,7 @@ impl DatabaseDriverV1 {
                 }
             })?;
 
-            let data = fetch_query_response_data(&conn_ptr, &query_id).await?;
+            let data = fetch_query_response_data(&conn_ptr, &query_id, cancel.clone()).await?;
             let descriptor = response_to_descriptor(&data, &self.wrapper_presets);
             if let Some(multi) = multistatement::try_into_multi_result(&data, descriptor.clone()) {
                 return Ok(multi);
@@ -616,7 +633,7 @@ impl DatabaseDriverV1 {
             // this async result-fetch path is not normally reached for file
             // transfers; pass skip_upload_on_content_match=false defensively.
             let rowset_data = self
-                .extract_rowset_data(&conn_ptr, data, refresh_sql, false)
+                .extract_rowset_data(&conn_ptr, data, refresh_sql, false, cancel)
                 .await?;
             let reader_ctx = resolve_reader_ctx(&conn_ptr).await?;
             Ok(self.build_execute_result(rowset_data, descriptor, reader_ctx))

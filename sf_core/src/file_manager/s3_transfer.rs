@@ -82,6 +82,7 @@ pub(super) async fn upload_to_s3_or_skip(
     base_policy: &RetryPolicy,
     multipart: MultipartParams,
     refresher: &mut Option<&mut dyn StageInfoRefresher>,
+    _cancel: tokio_util::sync::CancellationToken,
 ) -> Result<UploadStatus, UploadFileError> {
     let s3_key = format!("{}{filename}", stage_info.key_prefix);
     let policy = s3_retry_policy(base_policy);
@@ -869,6 +870,7 @@ pub(super) async fn download_from_s3(
     multipart: MultipartParams,
     refresher: &mut Option<&mut dyn StageInfoRefresher>,
     spill_target: SpillTarget<'_>,
+    _cancel: tokio_util::sync::CancellationToken,
 ) -> Result<S3Download, DownloadFileError> {
     let s3_key = format!("{}{filename}", stage_info.key_prefix);
     let policy = s3_retry_policy(base_policy);
@@ -2116,6 +2118,7 @@ mod tests {
             &base_policy(),
             MultipartParams::default(),
             &mut None,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("upload should succeed against the mock");
@@ -2207,6 +2210,7 @@ mod tests {
                 &base_policy(),
                 MultipartParams::default(),
                 &mut None,
+                tokio_util::sync::CancellationToken::new(),
             ),
         )
         .await
@@ -2311,6 +2315,7 @@ mod tests {
             &base_policy(),
             MultipartParams::default(),
             &mut None,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("encrypted S3 upload should succeed against the mock");
@@ -2524,6 +2529,7 @@ mod tests {
             &base_policy(),
             always_multipart(),
             &mut None,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("multipart upload should succeed against the mock");
@@ -2583,6 +2589,7 @@ mod tests {
             &base_policy_with_attempts(1), // single attempt: fail fast, no SDK retry storm
             always_multipart(),
             &mut None,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -2628,6 +2635,7 @@ mod tests {
             always_multipart(),
             &mut None,
             SpillTarget::Temp(spill.path()),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("ranged download should succeed against the mock");
@@ -2677,6 +2685,7 @@ mod tests {
             always_multipart(),
             &mut None,
             SpillTarget::Part(&part_path),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("ranged download should succeed against the mock");
@@ -2720,6 +2729,7 @@ mod tests {
             always_multipart(),
             &mut None,
             SpillTarget::Part(&part_path),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 

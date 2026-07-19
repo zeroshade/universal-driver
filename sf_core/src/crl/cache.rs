@@ -1167,6 +1167,7 @@ impl CrlCache {
             &ctx,
             &RetryPolicy::default(),
             self.config.max_download_size,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         {
@@ -1188,9 +1189,8 @@ impl CrlCache {
                     }),
                     HttpError::DeadlineExceeded { .. }
                     | HttpError::RetryAfterExceeded { .. }
-                    | HttpError::MaxAttempts { .. } => {
-                        crate::crl::error::HttpTimeoutSnafu {}.fail()
-                    }
+                    | HttpError::MaxAttempts { .. }
+                    | HttpError::Cancelled { .. } => crate::crl::error::HttpTimeoutSnafu {}.fail(),
                 };
             }
         };

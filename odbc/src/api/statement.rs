@@ -182,30 +182,39 @@ fn exec_direct_impl(statement_handle: sql::Handle, statement_text: &str) -> Odbc
                     },
                 );
                 client
-                    .statement_set_options(StatementSetOptionsRequest {
-                        stmt_handle: Some(stmt_handle),
-                        options,
-                    })
+                    .statement_set_options(
+                        StatementSetOptionsRequest {
+                            stmt_handle: Some(stmt_handle),
+                            options,
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                    )
                     .await?;
             }
 
             client
-                .statement_set_sql_query(StatementSetSqlQueryRequest {
-                    stmt_handle: Some(stmt_handle),
-                    query: effective_query,
-                })
+                .statement_set_sql_query(
+                    StatementSetSqlQueryRequest {
+                        stmt_handle: Some(stmt_handle),
+                        query: effective_query,
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await?;
 
             let response = client
-                .statement_execute_query(StatementExecuteQueryRequest {
-                    stmt_handle: Some(stmt_handle),
-                    bindings,
-                    timeout_seconds: if query_timeout > 0 {
-                        Some(query_timeout.min(u32::MAX as sql::ULen) as u32)
-                    } else {
-                        None
+                .statement_execute_query(
+                    StatementExecuteQueryRequest {
+                        stmt_handle: Some(stmt_handle),
+                        bindings,
+                        timeout_seconds: if query_timeout > 0 {
+                            Some(query_timeout.min(u32::MAX as sql::ULen) as u32)
+                        } else {
+                            None
+                        },
                     },
-                })
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await?;
             Ok(ExecDirectOutcome {
                 response,
@@ -310,10 +319,13 @@ fn update_numeric_settings(
     let g = global().context(OdbcRuntimeSnafu)?;
     g.block_on(async |c| {
         if let Ok(resp) = c
-            .connection_get_parameter(ConnectionGetParameterRequest {
-                conn_handle: Some(*conn_handle),
-                key: "ODBC_TREAT_DECIMAL_AS_INT".to_string(),
-            })
+            .connection_get_parameter(
+                ConnectionGetParameterRequest {
+                    conn_handle: Some(*conn_handle),
+                    key: "ODBC_TREAT_DECIMAL_AS_INT".to_string(),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             && let Some(value) = resp.value
         {
@@ -323,10 +335,13 @@ fn update_numeric_settings(
         }
 
         if let Ok(resp) = c
-            .connection_get_parameter(ConnectionGetParameterRequest {
-                conn_handle: Some(*conn_handle),
-                key: "ODBC_TREAT_BIG_NUMBER_AS_STRING".to_string(),
-            })
+            .connection_get_parameter(
+                ConnectionGetParameterRequest {
+                    conn_handle: Some(*conn_handle),
+                    key: "ODBC_TREAT_BIG_NUMBER_AS_STRING".to_string(),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             && let Some(value) = resp.value
         {
@@ -336,10 +351,13 @@ fn update_numeric_settings(
         }
 
         if let Ok(resp) = c
-            .connection_get_parameter(ConnectionGetParameterRequest {
-                conn_handle: Some(*conn_handle),
-                key: "VARCHAR_AND_BINARY_MAX_SIZE_IN_RESULT".to_string(),
-            })
+            .connection_get_parameter(
+                ConnectionGetParameterRequest {
+                    conn_handle: Some(*conn_handle),
+                    key: "VARCHAR_AND_BINARY_MAX_SIZE_IN_RESULT".to_string(),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             && let Some(value) = resp.value
             && let Ok(size) = value.parse::<u64>()
@@ -383,10 +401,13 @@ fn update_numeric_settings(
         // See PR #1068 review on `statement.rs:209`.
         if tz_format_needs_refresh(settings.tz_offset_format_cache, last_sql) {
             let rpc_result = c
-                .connection_get_parameter(ConnectionGetParameterRequest {
-                    conn_handle: Some(*conn_handle),
-                    key: "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
-                })
+                .connection_get_parameter(
+                    ConnectionGetParameterRequest {
+                        conn_handle: Some(*conn_handle),
+                        key: "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await
                 .map(|resp| resp.value)
                 .map_err(|e| format!("{e:?}"));
@@ -829,16 +850,22 @@ fn prepare_impl(statement_handle: sql::Handle, query: &str) -> OdbcResult<()> {
 
         let execution_outcome = run_cancellable(&guard, async_enabled, |client| async move {
             client
-                .statement_set_sql_query(StatementSetSqlQueryRequest {
-                    stmt_handle: Some(stmt_handle),
-                    query: query_owned,
-                })
+                .statement_set_sql_query(
+                    StatementSetSqlQueryRequest {
+                        stmt_handle: Some(stmt_handle),
+                        query: query_owned,
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await?;
 
             let prepare_response = client
-                .statement_prepare(StatementPrepareRequest {
-                    stmt_handle: Some(stmt_handle),
-                })
+                .statement_prepare(
+                    StatementPrepareRequest {
+                        stmt_handle: Some(stmt_handle),
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await?;
 
             let result = prepare_response.result.required("Result is required")?;
@@ -1048,22 +1075,28 @@ pub fn execute(statement_handle: sql::Handle) -> OdbcResult<()> {
                     },
                 );
                 client
-                    .statement_set_options(StatementSetOptionsRequest {
-                        stmt_handle: Some(stmt_handle),
-                        options,
-                    })
+                    .statement_set_options(
+                        StatementSetOptionsRequest {
+                            stmt_handle: Some(stmt_handle),
+                            options,
+                        },
+                        tokio_util::sync::CancellationToken::new(),
+                    )
                     .await?;
             }
             let response = client
-                .statement_execute_query(StatementExecuteQueryRequest {
-                    stmt_handle: Some(stmt_handle),
-                    bindings,
-                    timeout_seconds: if query_timeout > 0 {
-                        Some(query_timeout.min(u32::MAX as sql::ULen) as u32)
-                    } else {
-                        None
+                .statement_execute_query(
+                    StatementExecuteQueryRequest {
+                        stmt_handle: Some(stmt_handle),
+                        bindings,
+                        timeout_seconds: if query_timeout > 0 {
+                            Some(query_timeout.min(u32::MAX as sql::ULen) as u32)
+                        } else {
+                            None
+                        },
                     },
-                })
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await?;
             Ok(ExecuteOutcome {
                 response,
@@ -1222,10 +1255,13 @@ fn fetch_result_set_by_query_id(
     query_id: &str,
 ) -> OdbcResult<ResultSetResponse> {
     let response = global().context(OdbcRuntimeSnafu)?.block_on(async |c| {
-        c.connection_get_result_set(ConnectionGetResultSetRequest {
-            conn_handle: Some(conn_handle),
-            query_id: query_id.to_string(),
-        })
+        c.connection_get_result_set(
+            ConnectionGetResultSetRequest {
+                conn_handle: Some(conn_handle),
+                query_id: query_id.to_string(),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     })?;
     Ok(response)
@@ -1238,9 +1274,12 @@ fn fetch_result_set_by_query_id(
 fn fetch_stream_and_release(rs_handle: ResultSetHandle) -> OdbcResult<ArrowArrayStreamPtr> {
     let stream = {
         let response = global().context(OdbcRuntimeSnafu)?.block_on(async |c| {
-            c.result_set_get_stream(ResultSetGetStreamRequest {
-                result_set_handle: Some(rs_handle),
-            })
+            c.result_set_get_stream(
+                ResultSetGetStreamRequest {
+                    result_set_handle: Some(rs_handle),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         })?;
         response.stream.required("Stream is required")?
@@ -1252,9 +1291,12 @@ fn fetch_stream_and_release(rs_handle: ResultSetHandle) -> OdbcResult<ArrowArray
 fn release_result_set(rs_handle: ResultSetHandle) {
     if let Ok(rt) = global() {
         let _ = rt.block_on(async |c| {
-            c.result_set_release(ResultSetReleaseRequest {
-                result_set_handle: Some(rs_handle),
-            })
+            c.result_set_release(
+                ResultSetReleaseRequest {
+                    result_set_handle: Some(rs_handle),
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
         });
     }
@@ -1285,16 +1327,22 @@ pub(crate) fn execute_show_query_collect_batch(
 ) -> OdbcResult<RecordBatch> {
     let rt = global().context(OdbcRuntimeSnafu)?;
     let response = rt.block_on(async |c| {
-        c.statement_set_sql_query(StatementSetSqlQueryRequest {
-            stmt_handle: Some(stmt_handle),
-            query: sql.to_string(),
-        })
+        c.statement_set_sql_query(
+            StatementSetSqlQueryRequest {
+                stmt_handle: Some(stmt_handle),
+                query: sql.to_string(),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await?;
-        c.statement_execute_query(StatementExecuteQueryRequest {
-            stmt_handle: Some(stmt_handle),
-            bindings: None,
-            timeout_seconds: None,
-        })
+        c.statement_execute_query(
+            StatementExecuteQueryRequest {
+                stmt_handle: Some(stmt_handle),
+                bindings: None,
+                timeout_seconds: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await
     })?;
 
@@ -1499,10 +1547,13 @@ fn get_session_parameter(conn_handle: &ConnectionHandle, key: &str) -> OdbcResul
         .context(OdbcRuntimeSnafu)?
         .block_on(async |c| {
             let resp = c
-                .connection_get_parameter(ConnectionGetParameterRequest {
-                    conn_handle: Some(*conn_handle),
-                    key: key.to_string(),
-                })
+                .connection_get_parameter(
+                    ConnectionGetParameterRequest {
+                        conn_handle: Some(*conn_handle),
+                        key: key.to_string(),
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
                 .await?;
             Ok(resp.value)
         })
@@ -3213,7 +3264,7 @@ fn execute_dae(
                     c.statement_set_sql_query(StatementSetSqlQueryRequest {
                         stmt_handle: Some(stmt_handle),
                         query,
-                    })
+                    }, tokio_util::sync::CancellationToken::new())
                     .await?;
                 }
                 c.statement_execute_query(StatementExecuteQueryRequest {
@@ -3224,7 +3275,7 @@ fn execute_dae(
                     } else {
                         None
                     },
-                })
+                }, tokio_util::sync::CancellationToken::new())
                 .await
             } => result.map_err(Into::into),
         }
