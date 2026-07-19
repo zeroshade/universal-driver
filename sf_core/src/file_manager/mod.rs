@@ -171,6 +171,22 @@ fn current_stage_info(base: &StageInfo, refresher: Option<&dyn StageInfoRefreshe
     )
 }
 
+fn is_stream_cancelled_error(err: &FileManagerError) -> bool {
+    fn is_cancelled_io(source: &std::io::Error) -> bool {
+        source.kind() == std::io::ErrorKind::Interrupted
+            && source.to_string() == cloud_http::STREAM_CANCELLED_MESSAGE
+    }
+
+    match err {
+        FileManagerError::Io { source, .. } => is_cancelled_io(source),
+        FileManagerError::Decryption {
+            source: EncryptionError::Io { source, .. },
+            ..
+        } => is_cancelled_io(source),
+        _ => false,
+    }
+}
+
 /// Uploads one file. The `refresher` (if any) is used to refresh stage info
 /// on recoverable errors:
 /// - S3 stages: AWS `ExpiredToken` triggers a creds refresh
@@ -893,7 +909,7 @@ pub async fn download_single_file(
             let output_path2 = output_path.clone();
             // Blocking decrypt/write in a spawn_blocking task so the async runtime
             // thread is free to run the GCS producer that feeds the channel reader.
-            let output_byte_len =
+            let output_result =
                 tokio::task::spawn_blocking(move || -> Result<i64, FileManagerError> {
                     match (enc_material.as_ref(), cse_info) {
                         (Some(enc_material), Some(cse)) => {
@@ -966,7 +982,18 @@ pub async fn download_single_file(
                     }
                 })
                 .await
-                .context(BlockingTaskSnafu)??;
+                .context(BlockingTaskSnafu)?;
+
+            let output_byte_len = match output_result {
+                Ok(n) => n,
+                Err(e) if is_stream_cancelled_error(&e) => {
+                    return Err(GcsDownloadError::Cancelled {
+                        location: Location::new(file!(), line!(), 0),
+                    })
+                    .context(GcsDownloadSnafu);
+                }
+                Err(e) => return Err(e),
+            };
 
             // Use Content-Length hint as cloud_byte_count; if absent (chunked TE),
             // fall back to the on-cloud ciphertext bytes actually pulled off the
@@ -987,7 +1014,7 @@ pub async fn download_single_file(
                 &data.stage_info,
                 data.src_location.as_str(),
                 &azure_retry_policy(policy),
-                cancel,
+                cancel.clone(),
             )
             .await
             .context(AzureDownloadSnafu)?;
@@ -999,7 +1026,7 @@ pub async fn download_single_file(
             let partial_path2 = partial_path.clone();
             let output_path2 = output_path.clone();
 
-            let output_byte_len =
+            let output_result =
                 tokio::task::spawn_blocking(move || -> Result<i64, FileManagerError> {
                     match (enc_material.as_ref(), cse_info) {
                         (Some(enc_material), Some(cse)) => {
@@ -1072,7 +1099,18 @@ pub async fn download_single_file(
                     }
                 })
                 .await
-                .context(BlockingTaskSnafu)??;
+                .context(BlockingTaskSnafu)?;
+
+            let output_byte_len = match output_result {
+                Ok(n) => n,
+                Err(e) if is_stream_cancelled_error(&e) => {
+                    return Err(AzureDownloadError::Cancelled {
+                        location: Location::new(file!(), line!(), 0),
+                    })
+                    .context(AzureDownloadSnafu);
+                }
+                Err(e) => return Err(e),
+            };
 
             let cloud_byte_count = if cloud_byte_count_hint > 0 {
                 cloud_byte_count_hint
@@ -1309,6 +1347,8 @@ impl FileManagerError {
             FileManagerError::GcsDownload { source, .. } => source.is_cancelled(),
             FileManagerError::AzureUpload { source, .. } => source.is_cancelled(),
             FileManagerError::AzureDownload { source, .. } => source.is_cancelled(),
+            FileManagerError::S3Upload { source, .. } => source.is_cancelled(),
+            FileManagerError::S3Download { source, .. } => source.is_cancelled(),
             _ => false,
         }
     }

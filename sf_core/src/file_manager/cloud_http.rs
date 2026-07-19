@@ -18,6 +18,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Read-buffer size in bytes for the streaming upload producer — one channel chunk.
 const UPLOAD_CHUNK_SIZE_BYTES: usize = 64 * 1024;
@@ -26,6 +27,8 @@ const UPLOAD_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 /// 300s cap; the retry budget (`policy.max_elapsed`) must exceed this so at
 /// least one full attempt can complete.
 const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+pub(super) const STREAM_CANCELLED_MESSAGE: &str = "download cancelled";
 
 use std::collections::BTreeSet;
 
@@ -128,12 +131,29 @@ impl std::io::Read for StreamReader {
 /// scope; revisit if Range-resume becomes a requirement. The
 /// `gcs_streaming_mid_body_disconnect_surfaces_error` test pins this
 /// behaviour.
-pub(super) fn spawn_byte_stream_producer(response: reqwest::Response) -> StreamReader {
+pub(super) fn spawn_byte_stream_producer(
+    response: reqwest::Response,
+    cancel: CancellationToken,
+) -> StreamReader {
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Bytes>>(8);
     let stream = response.bytes_stream();
     tokio::spawn(async move {
         let mut stream = stream;
-        while let Some(chunk_result) = stream.next().await {
+        loop {
+            let chunk_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        STREAM_CANCELLED_MESSAGE,
+                    )));
+                    break;
+                }
+                chunk_result = stream.next() => chunk_result,
+            };
+            let Some(chunk_result) = chunk_result else {
+                break;
+            };
             let mapped = chunk_result.map_err(std::io::Error::other);
             // If the consumer dropped (decryption finished/errored) while we
             // had a pending error, the error is silently lost — the consumer

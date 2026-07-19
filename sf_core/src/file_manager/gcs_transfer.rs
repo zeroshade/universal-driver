@@ -405,7 +405,7 @@ pub async fn download_from_gcs(
         policy,
         per_file_index,
         refresher,
-        cancel,
+        cancel.clone(),
     )
     .await?;
 
@@ -974,7 +974,7 @@ pub async fn download_from_gcs_streaming(
         policy,
         per_file_index,
         refresher,
-        cancel,
+        cancel.clone(),
     )
     .await?;
 
@@ -1025,7 +1025,7 @@ pub async fn download_from_gcs_streaming(
     Ok(CloudStreamingDownload {
         cloud_byte_count,
         cse_info,
-        reader: cloud_http::spawn_byte_stream_producer(response),
+        reader: cloud_http::spawn_byte_stream_producer(response, cancel),
     })
 }
 

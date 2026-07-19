@@ -138,7 +138,7 @@ pub async fn download_from_azure(
         || client.get(build_sas_url(&url, sas_token.reveal())),
         Method::GET,
         policy,
-        cancel,
+        cancel.clone(),
     )
     .await?;
 
@@ -219,7 +219,7 @@ async fn send_head_to_azure_blob(
         || client.head(build_sas_url(url, sas_token.reveal())),
         Method::HEAD,
         policy,
-        cancel,
+        cancel.clone(),
     )
     .await
     {
@@ -623,7 +623,7 @@ pub async fn download_from_azure_streaming(
         || client.get(build_sas_url(&url, sas_token.reveal())),
         Method::GET,
         policy,
-        cancel,
+        cancel.clone(),
     )
     .await?;
 
@@ -672,7 +672,7 @@ pub async fn download_from_azure_streaming(
     Ok(CloudStreamingDownload {
         cloud_byte_count,
         cse_info,
-        reader: cloud_http::spawn_byte_stream_producer(response),
+        reader: cloud_http::spawn_byte_stream_producer(response, cancel),
     })
 }
 
