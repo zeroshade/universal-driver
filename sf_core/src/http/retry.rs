@@ -179,12 +179,20 @@ where
         match result {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    return on_response(resp).await;
+                    return tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => CancelledSnafu.fail(),
+                        res = on_response(resp) => res,
+                    };
                 }
                 if !should_retry_status(resp.status(), &policy.extra_retryable_statuses)
                     || !allow_retry(ctx, &policy.http)
                 {
-                    return on_response(resp).await;
+                    return tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => CancelledSnafu.fail(),
+                        res = on_response(resp) => res,
+                    };
                 }
 
                 if attempt >= max_attempts {
@@ -421,5 +429,50 @@ mod cancel_tests {
         )
         .await;
         assert!(matches!(result, Err(HttpError::Cancelled { .. })));
+    }
+
+    #[tokio::test]
+    async fn returns_cancelled_when_cancelled_while_reading_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let body_cancel = cancel.clone();
+        let client = reqwest::Client::new();
+        let ctx = HttpContext::new(Method::GET, "/slow-body");
+        let policy = RetryPolicy::default();
+        let url = format!("http://{addr}/");
+
+        let result: Result<(), HttpError> = execute_with_retry(
+            || client.get(url.clone()),
+            &ctx,
+            &policy,
+            move |_resp| {
+                let body_cancel = body_cancel.clone();
+                async move {
+                    // Cancellation lands mid-body: on_response must lose the race
+                    // and surface Cancelled instead of a slow success.
+                    body_cancel.cancel();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok::<(), HttpError>(())
+                }
+            },
+            cancel,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(HttpError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
     }
 }

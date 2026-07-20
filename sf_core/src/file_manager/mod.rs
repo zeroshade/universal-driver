@@ -837,6 +837,20 @@ pub async fn download_single_file(
             .await
             .context(BlockingTaskSnafu)??;
 
+            // Cancelled after the blocking write but before publish: abandon the
+            // artifact and report cancellation rather than publishing a completed
+            // file (mirrors the GCS/Azure arms). The git-stage spilled temp
+            // auto-deletes on drop; only the `.part` path needs explicit removal.
+            if cancel.is_cancelled() {
+                if spilled_temp.is_none() {
+                    warn_remove_partial(&partial_path);
+                }
+                return Err(DownloadFileError::Cancelled {
+                    location: Location::new(file!(), line!(), 0),
+                })
+                .context(S3DownloadSnafu);
+            }
+
             // Atomic publish: rename into place after the .await cancellation point.
             // `Some(temp)` (git-stage ranged download): the raw temp is renamed
             // directly to output — single same-FS rename.
