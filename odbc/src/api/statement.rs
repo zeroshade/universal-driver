@@ -270,7 +270,7 @@ fn finalize_execute_response(
     last_sql: Option<&str>,
     cancel: CancellationToken,
 ) -> OdbcResult<()> {
-    update_numeric_settings(&conn_handle, &mut conn.numeric_settings, last_sql)?;
+    update_numeric_settings(&conn_handle, &mut conn.numeric_settings, last_sql, cancel.clone())?;
 
     // Snapshot output pointers before passing `inner` into apply_execute_response.
     let param_set_size = inner.with_effective_apd(|apd| apd.array_size);
@@ -321,6 +321,7 @@ fn update_numeric_settings(
     conn_handle: &ConnectionHandle,
     settings: &mut NumericSettings,
     last_sql: Option<&str>,
+    cancel: CancellationToken,
 ) -> OdbcResult<()> {
     let g = global().context(OdbcRuntimeSnafu)?;
     g.block_on(async |c| {
@@ -330,7 +331,7 @@ fn update_numeric_settings(
                     conn_handle: Some(*conn_handle),
                     key: "ODBC_TREAT_DECIMAL_AS_INT".to_string(),
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
             && let Some(value) = resp.value
@@ -346,7 +347,7 @@ fn update_numeric_settings(
                     conn_handle: Some(*conn_handle),
                     key: "ODBC_TREAT_BIG_NUMBER_AS_STRING".to_string(),
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
             && let Some(value) = resp.value
@@ -362,7 +363,7 @@ fn update_numeric_settings(
                     conn_handle: Some(*conn_handle),
                     key: "VARCHAR_AND_BINARY_MAX_SIZE_IN_RESULT".to_string(),
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
             && let Some(value) = resp.value
@@ -412,7 +413,7 @@ fn update_numeric_settings(
                         conn_handle: Some(*conn_handle),
                         key: "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
                     },
-                    tokio_util::sync::CancellationToken::new(),
+                    cancel.clone(),
                 )
                 .await
                 .map(|resp| resp.value)
@@ -420,6 +421,12 @@ fn update_numeric_settings(
             apply_tz_offset_format_update(&mut settings.tz_offset_format_cache, rpc_result);
         }
     });
+    // A cancelled settings refresh must surface as OperationCanceled rather than
+    // silently completing finalization; the per-RPC error-swallowing above is for
+    // genuine transient failures, not caller-initiated cancellation.
+    if cancel.is_cancelled() {
+        return OperationCanceledSnafu.fail();
+    }
     Ok(())
 }
 
@@ -3345,6 +3352,7 @@ fn execute_dae(
         &conn_handle,
         &mut conn.numeric_settings,
         last_sql.as_deref(),
+        token.clone(),
     ) {
         inner.state.set(restored);
         return Err(e);
