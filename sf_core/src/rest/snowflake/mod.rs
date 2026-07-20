@@ -811,16 +811,22 @@ async fn send_login_request(
         &ctx,
         policy,
         |r| async move { Ok(r) },
-        cancel,
+        cancel.clone(),
     )
     .await
     .context(HttpRetrySnafu {
         context: "login request",
     })?;
 
-    read_response_json::<auth::AuthResponseMain>(response)
-        .await
-        .context(InvalidSnowflakeResponseSnafu)
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(crate::http::retry::CancelledSnafu.build()).context(HttpRetrySnafu {
+            context: "login request",
+        }),
+        parsed = read_response_json::<auth::AuthResponseMain>(response) => {
+            parsed.context(InvalidSnowflakeResponseSnafu)
+        }
+    }
 }
 
 /// Drift C.5: per-request DPoP signing context for `send_login_request`.
@@ -1824,9 +1830,17 @@ async fn execute_sync_query<'a>(
         context: "query request",
     })?;
 
-    let query_response = read_response_json::<query_response::Data>(response)
-        .await
-        .context(InvalidSnowflakeResponseSnafu)?;
+    let query_response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Err(crate::http::retry::CancelledSnafu.build()).context(HttpRetrySnafu {
+                context: "query request",
+            });
+        }
+        parsed = read_response_json::<query_response::Data>(response) => {
+            parsed.context(InvalidSnowflakeResponseSnafu)?
+        }
+    };
 
     let elapsed_ms = send_start.elapsed().as_secs_f64() * 1000.0;
     tracing::debug!(
@@ -1991,16 +2005,24 @@ pub async fn get_query_status(
         &ctx,
         retry_policy,
         |r| async move { Ok(r) },
-        cancel,
+        cancel.clone(),
     )
     .await
     .context(HttpRetrySnafu {
         context: "query status",
     })?;
 
-    let body: QueryStatusResponse = read_response_json::<Option<QueryStatusResponseData>>(response)
-        .await
-        .context(InvalidSnowflakeResponseSnafu)?;
+    let body: QueryStatusResponse = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Err(crate::http::retry::CancelledSnafu.build()).context(HttpRetrySnafu {
+                context: "query status",
+            });
+        }
+        parsed = read_response_json::<Option<QueryStatusResponseData>>(response) => {
+            parsed.context(InvalidSnowflakeResponseSnafu)?
+        }
+    };
 
     if !body.success {
         let message = body.message.unwrap_or_else(|| "Unknown error".to_owned());

@@ -224,12 +224,18 @@ pub async fn submit_statement_async<'a>(
         &ctx,
         policy,
         |r| async move { Ok(r) },
-        cancel,
+        cancel.clone(),
     )
     .await
     .map_err(map_http_error)?;
 
-    parse_submit_response(server_url, response).await
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(SfError::Cancelled {
+            location: current_location(),
+        }),
+        parsed = parse_submit_response(server_url, response) => parsed,
+    }
 }
 
 pub(super) async fn poll_query_status(
@@ -244,17 +250,23 @@ pub(super) async fn poll_query_status(
     let poll_request =
         move || apply_query_headers(client.get(result_url.clone()), client_info, session_token);
     let ctx = HttpContext::new(Method::GET, get_result_url.to_string());
-    let response = execute_with_retry(poll_request, &ctx, policy, |r| async move { Ok(r) }, cancel)
-        .await
-        .map_err(map_http_error)?;
+    let response =
+        execute_with_retry(poll_request, &ctx, policy, |r| async move { Ok(r) }, cancel.clone())
+            .await
+            .map_err(map_http_error)?;
     let status = response.status();
     if !status.is_success() {
         return Err(http_status_error(status));
     }
-    let body_bytes = response
-        .bytes()
-        .await
-        .map_err(|source| transport_error(source))?;
+    let body_bytes = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Err(SfError::Cancelled {
+                location: current_location(),
+            });
+        }
+        bytes = response.bytes() => bytes.map_err(|source| transport_error(source))?,
+    };
     let parsed: query_response::Response =
         serde_json::from_slice(&body_bytes).map_err(|source| body_parse_error(source))?;
     debug!(

@@ -97,7 +97,7 @@ pub async fn logout_session(
         &ctx,
         retry_policy,
         |resp| async move { Ok(resp) },
-        cancel,
+        cancel.clone(),
     )
     .await
     .map_err(map_http_error)
@@ -108,7 +108,18 @@ pub async fn logout_session(
 
     // Read response body as text first (avoids crash on non-JSON responses)
     let status = response.status();
-    let body_text = response.text().await.ok().unwrap_or_default();
+    let body_text = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Err(map_http_error(crate::http::retry::CancelledSnafu.build())).context(
+                AsyncQuerySnafu {
+                    request_id: Some(request_id),
+                    query_id: None,
+                },
+            );
+        }
+        text = response.text() => text.ok().unwrap_or_default(),
+    };
 
     // Try to parse as JSON
     let parsed: Option<LogoutResponse> = serde_json::from_str(&body_text).ok();

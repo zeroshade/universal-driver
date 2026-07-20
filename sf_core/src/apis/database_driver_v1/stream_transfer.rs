@@ -281,6 +281,9 @@ impl DatabaseDriverV1 {
             )
             .await
             .map_err(|e| {
+                if e.is_cancelled() {
+                    return CancelledSnafu.build();
+                }
                 InvalidArgumentSnafu {
                     argument: format!("Download failed: {e}"),
                 }
