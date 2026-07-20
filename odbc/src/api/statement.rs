@@ -3140,6 +3140,10 @@ where
     if async_enabled {
         let token_clone = token.clone();
         let future = f(client, token.clone());
+        // Publish the token BEFORE spawning so a concurrent SQLCancel cannot
+        // observe an empty slot while the task is already running (TOCTOU race).
+        // The async cleanup path clears the slot on poll completion / free.
+        *stmt.cancel_token.lock() = Some(token);
         let join_handle = g.spawn(async move {
             tokio::select! {
                 biased;
@@ -3147,7 +3151,6 @@ where
                 result = future => result,
             }
         });
-        *stmt.cancel_token.lock() = Some(token);
         return Ok(Execution::Spawned(join_handle));
     }
 
