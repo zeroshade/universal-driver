@@ -25,6 +25,7 @@ use arrow::array::{
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::error::ArrowError;
 use snafu::{OptionExt, ResultExt};
 use tokio::sync::Mutex;
 
@@ -32,7 +33,7 @@ use super::connection::{Connection, with_valid_session};
 use super::error::*;
 use super::global_state::DatabaseDriverV1;
 use super::like_pattern;
-use crate::chunks::PrefetchConfig;
+use crate::chunks::{ChunkError, PrefetchConfig};
 use crate::handle_manager::Handle;
 use crate::rest::snowflake::{
     QueryExecutionMode, QueryInput, RestError, snowflake_query_with_client,
@@ -685,7 +686,14 @@ fn rows_from_reader(
 ) -> Result<Vec<Vec<(String, String)>>, ApiError> {
     let mut rows = Vec::new();
     for batch_result in reader {
-        let batch = batch_result.context(ArrowParseSnafu)?;
+        let batch = match batch_result {
+            Ok(batch) => batch,
+            // A cancelled chunk download reaches the reader as a `ChunkError::Cancelled`
+            // boxed inside `ArrowError::ExternalError`; unwrap it so cancellation surfaces
+            // as CANCELLED instead of being flattened into `ApiError::ArrowParse`.
+            Err(e) if arrow_error_is_cancelled(&e) => return CancelledSnafu.fail(),
+            Err(e) => return Err(e).context(ArrowParseSnafu),
+        };
         let names: Vec<String> = batch
             .schema()
             .fields()
@@ -704,6 +712,16 @@ fn rows_from_reader(
         }
     }
     Ok(rows)
+}
+
+fn arrow_error_is_cancelled(err: &ArrowError) -> bool {
+    matches!(
+        err,
+        ArrowError::ExternalError(source)
+            if source
+                .downcast_ref::<ChunkError>()
+                .is_some_and(ChunkError::is_cancelled)
+    )
 }
 
 fn cell_as_string(column: &dyn Array, row_idx: usize) -> Option<String> {
@@ -1394,6 +1412,61 @@ fn build_full_columns_schema_list_array(
 mod tests {
     use super::*;
     use arrow::ipc::reader::StreamReader;
+
+    struct OneErrorReader {
+        schema: SchemaRef,
+        err: Option<ArrowError>,
+    }
+
+    impl Iterator for OneErrorReader {
+        type Item = Result<RecordBatch, ArrowError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.err.take().map(Err)
+        }
+    }
+
+    impl RecordBatchReader for OneErrorReader {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
+
+    fn one_error_reader(err: ArrowError) -> Box<dyn RecordBatchReader + Send> {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        Box::new(OneErrorReader {
+            schema,
+            err: Some(err),
+        })
+    }
+
+    #[test]
+    fn rows_from_reader_maps_cancelled_chunk_to_cancelled() {
+        let cancelled = ChunkError::Cancelled {
+            location: snafu::Location::default(),
+        };
+        let reader = one_error_reader(ArrowError::ExternalError(Box::new(cancelled)));
+
+        let err = rows_from_reader(reader).expect_err("cancelled drain must surface an error");
+
+        assert!(
+            matches!(err, ApiError::Cancelled { .. }),
+            "expected ApiError::Cancelled, got {err:?}"
+        );
+        assert!(err.is_cancelled());
+    }
+
+    #[test]
+    fn rows_from_reader_maps_other_arrow_error_to_arrow_parse() {
+        let reader = one_error_reader(ArrowError::ComputeError("boom".to_string()));
+
+        let err = rows_from_reader(reader).expect_err("reader error must surface");
+
+        assert!(
+            matches!(err, ApiError::ArrowParse { .. }),
+            "expected ApiError::ArrowParse, got {err:?}"
+        );
+        assert!(!err.is_cancelled());
+    }
 
     // --- Schema contract ---
 

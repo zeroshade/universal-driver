@@ -280,6 +280,13 @@ pub(super) async fn execute_logout_with_strategy(
         }
     };
 
+    // Cancellation is a caller-initiated abort, not an unrecoverable logout
+    // failure, so it must surface as CANCELLED even under BestEffort (which
+    // would otherwise suppress it into Ok(())).
+    if logout_result.as_ref().is_err_and(|e| e.is_cancelled()) {
+        return logout_result;
+    }
+
     error_strategy.handle_failed_logout(logout_result)
 }
 
