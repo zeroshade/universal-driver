@@ -123,6 +123,12 @@ pub enum ExternalBrowserError {
     },
 }
 
+impl ExternalBrowserError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, ExternalBrowserError::RetryExhausted { source, .. } if source.is_cancelled())
+    }
+}
+
 // ─── Main entry point ────────────────────────────────────────────────────────
 
 /// Run the full external browser authentication flow:

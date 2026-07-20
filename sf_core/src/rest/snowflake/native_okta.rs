@@ -102,6 +102,12 @@ pub enum NativeOktaError {
     },
 }
 
+impl NativeOktaError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self, NativeOktaError::RetryExhausted { source, .. } if source.is_cancelled())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthenticatorRequestResponse {
     success: bool,

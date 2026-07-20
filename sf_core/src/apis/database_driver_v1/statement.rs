@@ -222,8 +222,11 @@ impl DatabaseDriverV1 {
                 }
                 .fail();
             };
-            let stream = self.result_set_get_stream(rs_info.handle, cancel).await?;
+            // Release the handle whether or not the stream fetch succeeded — a
+            // cancelled or failed fetch must not leak the result set's rowset data.
+            let stream_result = self.result_set_get_stream(rs_info.handle, cancel).await;
             self.result_set_release(rs_info.handle)?;
+            let stream = stream_result?;
 
             let stmt_ptr =
                 self.statements

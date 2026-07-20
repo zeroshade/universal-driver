@@ -2488,6 +2488,8 @@ impl RestError {
         match self {
             RestError::AsyncQuery { source, .. } => source.is_cancelled(),
             RestError::HttpRetry { source, .. } => source.is_cancelled(),
+            RestError::NativeOkta { source, .. } => source.is_cancelled(),
+            RestError::ExternalBrowser { source, .. } => source.is_cancelled(),
             _ => false,
         }
     }
