@@ -3423,14 +3423,18 @@ pub fn more_results(statement_handle: sql::Handle) -> OdbcResult<()> {
     };
     drop(conn);
 
-    let rs = fetch_result_set_by_query_id(conn_handle, &query_id, CancellationToken::new())?;
+    // Arm the statement token so a concurrent SQLCancel can interrupt the
+    // blocking result-set/stream fetch for the next child result set.
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
+    let rs = fetch_result_set_by_query_id(conn_handle, &query_id, cancel.clone())?;
     let descriptor = rs.result_descriptor.as_ref();
     let statement_type_id = descriptor.and_then(|d| d.statement_type_id);
     let rows_affected = descriptor.and_then(|d| d.rows_affected);
     let rs_handle = rs
         .result_set_handle
         .required("ResultSet handle is required")?;
-    let stream = fetch_stream_and_release(rs_handle, CancellationToken::new())?;
+    let stream = fetch_stream_and_release(rs_handle, cancel)?;
     let execute_state =
         create_execute_state_from_stream(stream, statement_type_id, rows_affected, origin)?;
     set_state(&mut inner, execute_state);

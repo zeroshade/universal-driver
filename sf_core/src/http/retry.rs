@@ -311,14 +311,22 @@ pub async fn execute_bytes_with_retry<B>(
 where
     B: Fn() -> reqwest::RequestBuilder,
 {
-    let resp = execute_with_retry(build, ctx, policy, |r| async move { Ok(r) }, cancel).await?;
-    match resp.error_for_status() {
-        Ok(ok) => {
-            let bytes = ok.bytes().await.context(TransportSnafu)?;
-            Ok(bytes.to_vec())
-        }
-        Err(e) => Err(TransportSnafu.into_error(e)),
-    }
+    execute_with_retry(
+        build,
+        ctx,
+        policy,
+        |r| async move {
+            match r.error_for_status() {
+                Ok(ok) => {
+                    let bytes = ok.bytes().await.context(TransportSnafu)?;
+                    Ok(bytes.to_vec())
+                }
+                Err(e) => Err(TransportSnafu.into_error(e)),
+            }
+        },
+        cancel,
+    )
+    .await
 }
 
 /// Like [`execute_bytes_with_retry`] but streams the response body and aborts
