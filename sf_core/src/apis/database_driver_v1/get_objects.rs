@@ -644,7 +644,7 @@ async fn execute_show(
     // inline rowset here would silently drop most rows.
     let rowset_data = response.data.into_rowset_data();
     let reader =
-        super::query::read_batches(&rowset_data, http_client, &prefetch_config, None, cancel)
+        super::query::read_batches(&rowset_data, http_client, &prefetch_config, None, cancel.clone())
             .await
             .map_err(|e| {
                 if e.is_cancelled() {
@@ -658,7 +658,7 @@ async fn execute_show(
     // The reader drains chunks via `blocking_recv`, which panics if polled on a
     // runtime worker; drain it on a blocking thread while downloads progress on
     // the async workers.
-    let parsed = tokio::task::spawn_blocking(move || rows_from_reader(reader))
+    let parsed = tokio::task::spawn_blocking(move || rows_from_reader(reader, cancel))
         .await
         .map_err(|e| {
             InvalidArgumentSnafu {
@@ -683,9 +683,16 @@ async fn execute_show(
 /// metadata) and consumer (`get_column`) never drift.
 fn rows_from_reader(
     reader: Box<dyn RecordBatchReader + Send>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Vec<Vec<(String, String)>>, ApiError> {
     let mut rows = Vec::new();
     for batch_result in reader {
+        // Check on the success path too: draining already-buffered batches
+        // yields no error, so an error-only check would let cancellation slip
+        // through and the SHOW parse complete instead of surfacing CANCELLED.
+        if cancel.is_cancelled() {
+            return CancelledSnafu.fail();
+        }
         let batch = match batch_result {
             Ok(batch) => batch,
             // A cancelled chunk download reaches the reader as a `ChunkError::Cancelled`
@@ -1439,6 +1446,24 @@ mod tests {
         })
     }
 
+    struct OkBatchReader {
+        schema: SchemaRef,
+        batch: Option<RecordBatch>,
+    }
+
+    impl Iterator for OkBatchReader {
+        type Item = Result<RecordBatch, ArrowError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.batch.take().map(Ok)
+        }
+    }
+
+    impl RecordBatchReader for OkBatchReader {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+    }
+
     #[test]
     fn rows_from_reader_maps_cancelled_chunk_to_cancelled() {
         let cancelled = ChunkError::Cancelled {
@@ -1446,7 +1471,8 @@ mod tests {
         };
         let reader = one_error_reader(ArrowError::ExternalError(Box::new(cancelled)));
 
-        let err = rows_from_reader(reader).expect_err("cancelled drain must surface an error");
+        let err = rows_from_reader(reader, tokio_util::sync::CancellationToken::new())
+            .expect_err("cancelled drain must surface an error");
 
         assert!(
             matches!(err, ApiError::Cancelled { .. }),
@@ -1459,13 +1485,38 @@ mod tests {
     fn rows_from_reader_maps_other_arrow_error_to_arrow_parse() {
         let reader = one_error_reader(ArrowError::ComputeError("boom".to_string()));
 
-        let err = rows_from_reader(reader).expect_err("reader error must surface");
+        let err = rows_from_reader(reader, tokio_util::sync::CancellationToken::new())
+            .expect_err("reader error must surface");
 
         assert!(
             matches!(err, ApiError::ArrowParse { .. }),
             "expected ApiError::ArrowParse, got {err:?}"
         );
         assert!(!err.is_cancelled());
+    }
+
+    #[test]
+    fn rows_from_reader_cancelled_token_during_successful_drain() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef],
+        )
+        .unwrap();
+        let reader = Box::new(OkBatchReader {
+            schema,
+            batch: Some(batch),
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let err = rows_from_reader(reader, cancel)
+            .expect_err("cancelled token must surface even on a successful drain");
+
+        assert!(
+            matches!(err, ApiError::Cancelled { .. }),
+            "expected ApiError::Cancelled, got {err:?}"
+        );
     }
 
     // --- Schema contract ---
@@ -1756,7 +1807,7 @@ mod tests {
         }
         let chunk_base64 = BASE64.encode(&buf);
         let reader = single_chunk_reader(&chunk_base64, None).unwrap();
-        let rows = rows_from_reader(reader).unwrap();
+        let rows = rows_from_reader(reader, tokio_util::sync::CancellationToken::new()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].1, "MY_TABLE");
         assert_eq!(rows[0][1].1, "DB");

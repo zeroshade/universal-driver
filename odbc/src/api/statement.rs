@@ -1333,6 +1333,12 @@ pub(crate) fn collect_nested_batch(
     let schema = reader.schema();
     let mut batches = vec![];
     for b in &mut *reader {
+        // Check on the success path too: a reader draining already-buffered
+        // batches yields no error, so an error-only check would let SQLCancel
+        // slip through and the operation complete instead of returning HY008.
+        if cancel.is_cancelled() {
+            return OperationCanceledSnafu.fail();
+        }
         let batch = match b {
             Ok(batch) => batch,
             // Draining the reader materializes external chunks; if SQLCancel
