@@ -2416,7 +2416,7 @@ fn execute_get_objects_and_flatten(
         .context(ArrowArrayStreamReaderCreationSnafu)?;
 
     // Read all batches from the nested Arrow stream
-    let nested_batch = collect_nested_batch(Box::new(reader))?;
+    let nested_batch = collect_nested_batch(Box::new(reader), cancel)?;
 
     // Flatten the nested batch into the flat 5-col ODBC result
     let flat_batch = flatten_to_odbc(nested_batch, depth)?;
@@ -2506,7 +2506,7 @@ fn execute_get_columns_and_flatten(
     let reader = ArrowArrayStreamReader::try_new(owned_stream)
         .context(ArrowArrayStreamReaderCreationSnafu)?;
 
-    let nested_batch = collect_nested_batch(Box::new(reader))?;
+    let nested_batch = collect_nested_batch(Box::new(reader), cancel)?;
     let flat_batch = flatten_columns_to_odbc(nested_batch, &numeric_settings)?;
 
     let schema = flat_batch.schema();

@@ -1321,11 +1321,22 @@ fn release_result_set(rs_handle: ResultSetHandle) {
 
 pub(crate) fn collect_nested_batch(
     mut reader: Box<dyn RecordBatchReader + Send>,
+    cancel: CancellationToken,
 ) -> OdbcResult<RecordBatch> {
     let schema = reader.schema();
     let mut batches = vec![];
     for b in &mut *reader {
-        let batch = b.context(ArrowBatchReadSnafu)?;
+        let batch = match b {
+            Ok(batch) => batch,
+            // Draining the reader materializes external chunks; if SQLCancel
+            // fired during that blocking read, classify it as OperationCanceled
+            // (HY008) rather than a generic ArrowBatchRead error.
+            Err(e) if cancel.is_cancelled() => {
+                tracing::debug!(error = %e, "reader drain cancelled");
+                return OperationCanceledSnafu.fail();
+            }
+            Err(e) => return Err(e).context(ArrowBatchReadSnafu),
+        };
         batches.push(batch);
     }
     if batches.is_empty() {
@@ -1380,9 +1391,9 @@ pub(crate) fn execute_show_query_collect_batch(
         }
     };
 
-    let stream = fetch_stream_and_release(rs_handle, cancel)?;
+    let stream = fetch_stream_and_release(rs_handle, cancel.clone())?;
     let reader = reader_from_protobuf_stream(stream)?;
-    collect_nested_batch(Box::new(reader))
+    collect_nested_batch(Box::new(reader), cancel)
 }
 
 fn create_execute_state_from_stream(
