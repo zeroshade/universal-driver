@@ -17,7 +17,8 @@ use crate::api::error::{
 };
 use crate::api::runtime::global;
 use crate::api::statement::{
-    collect_nested_batch, execute_show_query_collect_batch, set_state_for_catalog,
+    arm_statement_cancel, collect_nested_batch, execute_show_query_collect_batch,
+    set_state_for_catalog,
 };
 use crate::api::utils::{catalog_arg_to_pattern, escape_like_wildcards};
 use crate::api::{
@@ -162,6 +163,8 @@ pub fn tables<E: OdbcEncoding>(
 
     validate_catalog_stmt_ready(&inner)?;
 
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
     let conn_handle = match &conn.state {
         ConnectionState::Connected { conn_handle, .. } => *conn_handle,
         ConnectionState::Disconnected => return DisconnectedSnafu.fail(),
@@ -186,6 +189,7 @@ pub fn tables<E: OdbcEncoding>(
             None,
             None,
             vec![],
+            cancel,
         );
     }
 
@@ -203,6 +207,7 @@ pub fn tables<E: OdbcEncoding>(
             None,
             None,
             vec![],
+            cancel,
         );
     }
 
@@ -224,7 +229,7 @@ pub fn tables<E: OdbcEncoding>(
     let catalog_raw = if metadata_id {
         catalog_raw
     } else {
-        resolve_null_catalog_to_connection_context(catalog_raw, conn_handle)?
+        resolve_null_catalog_to_connection_context(catalog_raw, conn_handle, cancel.clone())?
     };
     let catalog_pattern = catalog_arg_to_pattern(catalog_raw.as_deref(), metadata_id)?;
     let schema_pattern = catalog_arg_to_pattern(schema_raw.as_deref(), metadata_id)?;
@@ -241,6 +246,7 @@ pub fn tables<E: OdbcEncoding>(
         schema_pattern,
         table_pattern,
         table_types,
+        cancel,
     )
 }
 
@@ -257,6 +263,7 @@ pub fn tables<E: OdbcEncoding>(
 fn resolve_null_catalog_to_connection_context(
     catalog_raw: Option<String>,
     conn_handle: sf_core::protobuf::generated::database_driver_v1::ConnectionHandle,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> OdbcResult<Option<String>> {
     if catalog_raw.is_some() {
         return Ok(catalog_raw);
@@ -270,7 +277,7 @@ fn resolve_null_catalog_to_connection_context(
                 info_codes: vec![],
                 include_master_token: false,
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel,
         )
         .await
     })?;
@@ -325,10 +332,12 @@ pub fn columns<E: OdbcEncoding>(
     let numeric_settings = conn.numeric_settings;
     drop(conn);
 
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
     let catalog_raw = if metadata_id {
         catalog_raw
     } else {
-        resolve_null_catalog_to_connection_context(catalog_raw, conn_handle)?
+        resolve_null_catalog_to_connection_context(catalog_raw, conn_handle, cancel.clone())?
     };
     let catalog_pattern = catalog_arg_to_pattern(catalog_raw.as_deref(), metadata_id)?;
     let schema_pattern = catalog_arg_to_pattern(schema_raw.as_deref(), metadata_id)?;
@@ -343,6 +352,7 @@ pub fn columns<E: OdbcEncoding>(
         schema_pattern,
         table_pattern,
         column_pattern,
+        cancel,
     )
 }
 
@@ -432,6 +442,7 @@ fn build_show_in_scope(catalog: Option<&str>, schema: Option<&str>, table: Optio
 
 fn metadata_request_use_connection_ctx(
     conn_handle: sf_core::protobuf::generated::database_driver_v1::ConnectionHandle,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> OdbcResult<bool> {
     let rt = global().context(OdbcRuntimeSnafu)?;
     let resp = rt.block_on(async |c| {
@@ -440,7 +451,7 @@ fn metadata_request_use_connection_ctx(
                 conn_handle: Some(conn_handle),
                 key: "CLIENT_METADATA_REQUEST_USE_CONNECTION_CTX".to_string(),
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel,
         )
         .await
     });
@@ -455,13 +466,14 @@ fn resolve_show_identifiers(
     schema: Option<String>,
     table: Option<&str>,
     conn_handle: sf_core::protobuf::generated::database_driver_v1::ConnectionHandle,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> OdbcResult<(Option<String>, Option<String>)> {
     if catalog.is_some() && schema.is_some() {
         return Ok((catalog, schema));
     }
 
     let table_specified = table.is_some_and(|t| !t.is_empty());
-    let use_ctx = metadata_request_use_connection_ctx(conn_handle)?;
+    let use_ctx = metadata_request_use_connection_ctx(conn_handle, cancel.clone())?;
     let needs_info = catalog.is_none() || (schema.is_none() && (use_ctx || table_specified));
     if !needs_info {
         return Ok((catalog, schema));
@@ -475,7 +487,7 @@ fn resolve_show_identifiers(
                 info_codes: vec![],
                 include_master_token: false,
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel,
         )
         .await
     })?;
@@ -735,6 +747,8 @@ pub fn primary_keys<E: OdbcEncoding>(
     let stmt_handle = guard.stmt_handle;
     drop(conn);
 
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
     if metadata_id {
         if catalog_raw.is_none() {
             return NullPointerSnafu.fail();
@@ -764,8 +778,13 @@ pub fn primary_keys<E: OdbcEncoding>(
         (catalog_raw, schema_raw, table_raw)
     };
 
-    let (catalog_raw, schema_raw) =
-        resolve_show_identifiers(catalog_raw, schema_raw, table_raw.as_deref(), conn_handle)?;
+    let (catalog_raw, schema_raw) = resolve_show_identifiers(
+        catalog_raw,
+        schema_raw,
+        table_raw.as_deref(),
+        conn_handle,
+        cancel.clone(),
+    )?;
 
     let scope = build_show_in_scope(
         catalog_raw.as_deref(),
@@ -774,7 +793,7 @@ pub fn primary_keys<E: OdbcEncoding>(
     );
     let sql = format!("SHOW PRIMARY KEYS IN {scope}");
 
-    let show_batch = match execute_show_query_collect_batch(stmt_handle, &sql) {
+    let show_batch = match execute_show_query_collect_batch(stmt_handle, &sql, cancel) {
         Ok(batch) => batch,
         Err(e) => {
             if e.server_sql_state()
@@ -1193,6 +1212,8 @@ pub fn foreign_keys<E: OdbcEncoding>(
     let stmt_handle = guard.stmt_handle;
     drop(conn);
 
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
     if metadata_id {
         // Only the side whose table was supplied carries required identifier
         // args; a single-sided query intentionally leaves the other side NULL.
@@ -1246,12 +1267,14 @@ pub fn foreign_keys<E: OdbcEncoding>(
         pk_schema_raw,
         pk_table_raw.as_deref(),
         conn_handle,
+        cancel.clone(),
     )?;
     let (fk_catalog_raw, fk_schema_raw) = resolve_show_identifiers(
         fk_catalog_raw,
         fk_schema_raw,
         fk_table_raw.as_deref(),
         conn_handle,
+        cancel.clone(),
     )?;
 
     let sql = build_show_foreign_keys_command(
@@ -1263,7 +1286,7 @@ pub fn foreign_keys<E: OdbcEncoding>(
         fk_table_raw.as_deref(),
     );
 
-    let show_batch = match execute_show_query_collect_batch(stmt_handle, &sql) {
+    let show_batch = match execute_show_query_collect_batch(stmt_handle, &sql, cancel) {
         Ok(batch) => batch,
         Err(e) => {
             if e.server_sql_state()
@@ -1399,10 +1422,14 @@ fn returns_table(data_type: &str) -> bool {
 /// Runs `SELECT database_name FROM information_schema.databases` to enumerate the
 /// databases to union over when the caller passes a NULL catalog without
 /// connection-context resolution (mirrors the reference `QueryDatabases`).
-fn enumerate_databases(stmt_handle: StatementHandle) -> OdbcResult<Vec<String>> {
+fn enumerate_databases(
+    stmt_handle: StatementHandle,
+    cancel: tokio_util::sync::CancellationToken,
+) -> OdbcResult<Vec<String>> {
     let batch = execute_show_query_collect_batch(
         stmt_handle,
         "select database_name from information_schema.databases",
+        cancel,
     )?;
     let mut dbs = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
@@ -1554,6 +1581,8 @@ pub fn procedures<E: OdbcEncoding>(
     let stmt_handle = guard.stmt_handle;
     drop(conn);
 
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
     // In identifier mode (SQL_ATTR_METADATA_ID = TRUE) every argument is a
     // required identifier: a NULL pointer is HY009.
     if metadata_id && (catalog_raw.is_none() || schema_raw.is_none() || proc_raw.is_none()) {
@@ -1574,7 +1603,7 @@ pub fn procedures<E: OdbcEncoding>(
     // NULL catalog under CLIENT_METADATA_REQUEST_USE_CONNECTION_CTX resolves to
     // the connection's current database (and schema, if schema is also NULL);
     // otherwise a NULL catalog enumerates every database (union all).
-    if catalog_raw.is_none() && metadata_request_use_connection_ctx(conn_handle)? {
+    if catalog_raw.is_none() && metadata_request_use_connection_ctx(conn_handle, cancel.clone())? {
         let rt = global().context(OdbcRuntimeSnafu)?;
         let info = rt.block_on(async |c| {
             c.connection_get_info(
@@ -1583,7 +1612,7 @@ pub fn procedures<E: OdbcEncoding>(
                     info_codes: vec![],
                     include_master_token: false,
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
         })?;
@@ -1595,7 +1624,7 @@ pub fn procedures<E: OdbcEncoding>(
 
     let db_names = match db_name {
         Some(db) => vec![db],
-        None => enumerate_databases(stmt_handle)?,
+        None => enumerate_databases(stmt_handle, cancel.clone())?,
     };
 
     if db_names.is_empty() {
@@ -1608,7 +1637,7 @@ pub fn procedures<E: OdbcEncoding>(
         proc_pattern.as_deref(),
     );
 
-    let batch = match execute_show_query_collect_batch(stmt_handle, &sql) {
+    let batch = match execute_show_query_collect_batch(stmt_handle, &sql, cancel) {
         Ok(batch) => batch,
         Err(e) => {
             if e.server_sql_state()
@@ -2228,6 +2257,8 @@ pub fn procedure_columns<E: OdbcEncoding>(
     let stmt_handle = guard.stmt_handle;
     drop(conn);
 
+    let (_cancel_guard, cancel) = arm_statement_cancel(&guard);
+
     // Identifier mode (SQL_ATTR_METADATA_ID = TRUE): catalog, schema, and proc
     // name are all required identifiers — a NULL pointer is HY009. ColumnName may
     // still be NULL (means "all columns").
@@ -2246,7 +2277,7 @@ pub fn procedure_columns<E: OdbcEncoding>(
     // the signature is parsed (the type strings never reach the server query).
     let column_pattern = catalog_arg_to_pattern(column_raw.as_deref(), metadata_id)?;
 
-    if catalog_raw.is_none() && metadata_request_use_connection_ctx(conn_handle)? {
+    if catalog_raw.is_none() && metadata_request_use_connection_ctx(conn_handle, cancel.clone())? {
         let rt = global().context(OdbcRuntimeSnafu)?;
         let info = rt.block_on(async |c| {
             c.connection_get_info(
@@ -2255,7 +2286,7 @@ pub fn procedure_columns<E: OdbcEncoding>(
                     info_codes: vec![],
                     include_master_token: false,
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
         })?;
@@ -2267,7 +2298,7 @@ pub fn procedure_columns<E: OdbcEncoding>(
 
     let db_names = match db_name {
         Some(db) => vec![db],
-        None => enumerate_databases(stmt_handle)?,
+        None => enumerate_databases(stmt_handle, cancel.clone())?,
     };
 
     if db_names.is_empty() {
@@ -2280,7 +2311,7 @@ pub fn procedure_columns<E: OdbcEncoding>(
         proc_pattern.as_deref(),
     );
 
-    let batch = match execute_show_query_collect_batch(stmt_handle, &sql) {
+    let batch = match execute_show_query_collect_batch(stmt_handle, &sql, cancel) {
         Ok(batch) => batch,
         Err(e) => {
             if e.server_sql_state()
@@ -2319,6 +2350,7 @@ fn execute_get_objects_and_flatten(
     db_schema: Option<String>,
     table_name: Option<String>,
     table_type: Vec<String>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> OdbcResult<()> {
     let rt = global().context(OdbcRuntimeSnafu)?;
 
@@ -2333,7 +2365,7 @@ fn execute_get_objects_and_flatten(
                 table_type,
                 column_name: None,
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel.clone(),
         )
         .await
     })?;
@@ -2353,11 +2385,12 @@ fn execute_get_objects_and_flatten(
                 ResultSetGetStreamRequest {
                     result_set_handle: Some(rs_handle),
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
         })?;
-        // Release is best-effort
+        // Release is best-effort and must not reuse a possibly-cancelled token,
+        // or a cancelled operation would skip cleanup and leak the result set.
         let _ = rt.block_on(async |c| {
             c.result_set_release(
                 ResultSetReleaseRequest {
@@ -2409,6 +2442,7 @@ fn execute_get_columns_and_flatten(
     db_schema: Option<String>,
     table_name: Option<String>,
     column_name: Option<String>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> OdbcResult<()> {
     let rt = global().context(OdbcRuntimeSnafu)?;
 
@@ -2423,7 +2457,7 @@ fn execute_get_columns_and_flatten(
                 table_type: vec![],
                 column_name,
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel.clone(),
         )
         .await
     })?;
@@ -2442,10 +2476,12 @@ fn execute_get_columns_and_flatten(
                 ResultSetGetStreamRequest {
                     result_set_handle: Some(rs_handle),
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel.clone(),
             )
             .await
         })?;
+        // Release is best-effort and must not reuse a possibly-cancelled token,
+        // or a cancelled operation would skip cleanup and leak the result set.
         let _ = rt.block_on(async |c| {
             c.result_set_release(
                 ResultSetReleaseRequest {

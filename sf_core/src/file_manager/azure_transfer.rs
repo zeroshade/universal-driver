@@ -168,13 +168,15 @@ pub async fn download_from_azure(
         None => None,
     };
 
-    let data = response
-        .bytes()
-        .await
-        .map_err(|e| AzureRequestError::Http {
-            detail: sanitize_sas(e.to_string()),
-        })?
-        .to_vec();
+    let data = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return azure_download_error::CancelledSnafu.fail(),
+        bytes = response.bytes() => bytes
+            .map_err(|e| AzureRequestError::Http {
+                detail: sanitize_sas(e.to_string()),
+            })?
+            .to_vec(),
+    };
     let cloud_byte_count = data.len() as i64;
 
     Ok(DownloadResponse {

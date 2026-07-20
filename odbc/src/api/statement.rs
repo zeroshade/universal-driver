@@ -1189,7 +1189,7 @@ fn apply_execute_response(
                 .result_set_handle
                 .required("ResultSet handle is required")?;
             let query_id = descriptor.query_id.clone();
-            let stream = fetch_stream_and_release(rs_handle)?;
+            let stream = fetch_stream_and_release(rs_handle, CancellationToken::new())?;
             let execute_state = create_execute_state_from_stream(
                 stream,
                 descriptor.statement_type_id,
@@ -1240,7 +1240,7 @@ fn apply_execute_response(
             let rs_handle = rs
                 .result_set_handle
                 .required("ResultSet handle is required")?;
-            let stream = fetch_stream_and_release(rs_handle)?;
+            let stream = fetch_stream_and_release(rs_handle, CancellationToken::new())?;
             let execute_state =
                 create_execute_state_from_stream(stream, statement_type_id, rows_affected, origin)?;
             stmt.multi_current_idx = 1;
@@ -1272,14 +1272,17 @@ fn fetch_result_set_by_query_id(
 ///
 /// `result_set_get_stream` takes ownership of the prebuilt stream (one-shot),
 /// so the handle is no longer useful after this call.
-fn fetch_stream_and_release(rs_handle: ResultSetHandle) -> OdbcResult<ArrowArrayStreamPtr> {
+fn fetch_stream_and_release(
+    rs_handle: ResultSetHandle,
+    cancel: CancellationToken,
+) -> OdbcResult<ArrowArrayStreamPtr> {
     let stream = {
         let response = global().context(OdbcRuntimeSnafu)?.block_on(async |c| {
             c.result_set_get_stream(
                 ResultSetGetStreamRequest {
                     result_set_handle: Some(rs_handle),
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancel,
             )
             .await
         })?;
@@ -1325,6 +1328,7 @@ pub(crate) fn collect_nested_batch(
 pub(crate) fn execute_show_query_collect_batch(
     stmt_handle: StatementHandle,
     sql: &str,
+    cancel: CancellationToken,
 ) -> OdbcResult<RecordBatch> {
     let rt = global().context(OdbcRuntimeSnafu)?;
     let response = rt.block_on(async |c| {
@@ -1333,7 +1337,7 @@ pub(crate) fn execute_show_query_collect_batch(
                 stmt_handle: Some(stmt_handle),
                 query: sql.to_string(),
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel.clone(),
         )
         .await?;
         c.statement_execute_query(
@@ -1342,7 +1346,7 @@ pub(crate) fn execute_show_query_collect_batch(
                 bindings: None,
                 timeout_seconds: None,
             },
-            tokio_util::sync::CancellationToken::new(),
+            cancel.clone(),
         )
         .await
     })?;
@@ -1363,7 +1367,7 @@ pub(crate) fn execute_show_query_collect_batch(
         }
     };
 
-    let stream = fetch_stream_and_release(rs_handle)?;
+    let stream = fetch_stream_and_release(rs_handle, cancel)?;
     let reader = reader_from_protobuf_stream(stream)?;
     collect_nested_batch(Box::new(reader))
 }
@@ -3008,7 +3012,7 @@ fn accumulate_put_data(
 
 /// Sets `cancel_token` on creation and clears it on drop, so every exit
 /// path (including early returns and panics) releases the token.
-struct CancelTokenGuard<'a> {
+pub(crate) struct CancelTokenGuard<'a> {
     slot: &'a parking_lot::Mutex<Option<CancellationToken>>,
 }
 
@@ -3027,6 +3031,20 @@ impl Drop for CancelTokenGuard<'_> {
         *self.slot.lock() = None;
     }
 }
+
+/// Arms a fresh cancellation token on the statement so `SQLCancel` can abort
+/// the in-flight operation, returning the RAII guard (clears the slot on every
+/// exit path) and a clone of the token to thread into the operation's RPCs.
+/// The token slot is a separate mutex from `StatementInner`, so `SQLCancel`
+/// reaches it without contending on the lock a running operation holds.
+pub(crate) fn arm_statement_cancel(
+    stmt: &crate::api::Statement,
+) -> (CancelTokenGuard<'_>, CancellationToken) {
+    let token = CancellationToken::new();
+    let guard = CancelTokenGuard::arm(&stmt.cancel_token, token.clone());
+    (guard, token)
+}
+
 
 /// Awaits a finished `JoinHandle` and translates panics into internal errors.
 fn poll_join_handle<T>(join_handle: tokio::task::JoinHandle<OdbcResult<T>>) -> OdbcResult<T> {
@@ -3399,7 +3417,7 @@ pub fn more_results(statement_handle: sql::Handle) -> OdbcResult<()> {
     let rs_handle = rs
         .result_set_handle
         .required("ResultSet handle is required")?;
-    let stream = fetch_stream_and_release(rs_handle)?;
+    let stream = fetch_stream_and_release(rs_handle, CancellationToken::new())?;
     let execute_state =
         create_execute_state_from_stream(stream, statement_type_id, rows_affected, origin)?;
     set_state(&mut inner, execute_state);

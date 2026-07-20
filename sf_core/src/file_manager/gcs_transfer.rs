@@ -450,11 +450,13 @@ pub async fn download_from_gcs(
         None => None,
     };
 
-    let data = response
-        .bytes()
-        .await
-        .map_err(|source| GcsRequestError::Http { source })?
-        .to_vec();
+    let data = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return gcs_download_error::CancelledSnafu.fail(),
+        bytes = response.bytes() => bytes
+            .map_err(|source| GcsRequestError::Http { source })?
+            .to_vec(),
+    };
     let actual_len = data.len() as u64;
 
     if let Some(expected) = expected_length {
