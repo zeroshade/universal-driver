@@ -68,6 +68,7 @@ async fn request_text_with_retry(
     build: impl Fn() -> reqwest::RequestBuilder,
     ctx: &HttpContext,
     policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(StatusCode, String), HttpError> {
     execute_with_retry(
         build,
@@ -78,7 +79,7 @@ async fn request_text_with_retry(
             let text = resp.text().await.context(TransportSnafu)?;
             Ok((status, text))
         },
-        tokio_util::sync::CancellationToken::new(),
+        cancel,
     )
     .await
 }
@@ -509,6 +510,7 @@ pub async fn auth_request_data(
     token_cache: Option<&dyn TokenCache>,
     prompt_locks: Option<&std::sync::Arc<prompt_lock::PromptLockMap>>,
     retry_policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<AuthRequestData, RestError> {
     let mut data = base_auth_request_data(login_parameters);
     data.spcs_token = login_parameters.spcs_token.clone();
@@ -523,10 +525,15 @@ pub async fn auth_request_data(
 
     match &login_parameters.login_method {
         LoginMethod::NativeOkta(okta_config) => {
-            let saml_html =
-                fetch_native_okta_saml(client, login_parameters, retry_policy, okta_config)
-                    .await
-                    .context(NativeOktaSnafu)?;
+            let saml_html = fetch_native_okta_saml(
+                client,
+                login_parameters,
+                retry_policy,
+                okta_config,
+                cancel.clone(),
+            )
+            .await
+            .context(NativeOktaSnafu)?;
 
             data.login_name = Some(okta_config.username.clone());
             data.authenticator = Some(okta_config.okta_url.to_string());
@@ -574,6 +581,7 @@ pub async fn auth_request_data(
                     *authentication_timeout_secs,
                     &DefaultBrowserOpener,
                     retry_policy,
+                    cancel.clone(),
                 )
                 .await
                 .context(ExternalBrowserSnafu)?;
@@ -1002,6 +1010,7 @@ pub async fn snowflake_login_with_client(
         token_cache,
         prompt_locks,
         retry_policy,
+        cancel.clone(),
     )
     .await?;
     tracing::Span::current().record("login_name", &login_request_data.login_name);
@@ -1066,6 +1075,7 @@ pub async fn snowflake_login_with_client(
                     token_cache,
                     prompt_locks,
                     retry_policy,
+                    cancel.clone(),
                 )
                 .await?;
                 let retry_request = AuthRequest { data: retry_data };
@@ -1126,6 +1136,7 @@ pub async fn snowflake_login_with_client(
                     token_cache,
                     prompt_locks,
                     retry_policy,
+                    cancel.clone(),
                 )
                 .await?;
                 let retry_request = AuthRequest { data: retry_data };
@@ -2936,6 +2947,7 @@ mod tests {
                 None,
                 None,
                 &RetryPolicy::default(),
+                tokio_util::sync::CancellationToken::new(),
             ))
             .unwrap();
 
@@ -2970,6 +2982,7 @@ mod tests {
                 None,
                 None,
                 &RetryPolicy::default(),
+                tokio_util::sync::CancellationToken::new(),
             ))
             .unwrap();
 
@@ -2996,6 +3009,7 @@ mod tests {
                 None,
                 None,
                 &RetryPolicy::default(),
+                tokio_util::sync::CancellationToken::new(),
             ))
             .unwrap();
 
@@ -3026,6 +3040,7 @@ mod tests {
                 None,
                 None,
                 &RetryPolicy::default(),
+                tokio_util::sync::CancellationToken::new(),
             ))
             .unwrap();
 

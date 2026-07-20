@@ -142,6 +142,7 @@ pub(crate) async fn external_browser_authenticate(
     authentication_timeout_secs: u64,
     browser_opener: &dyn BrowserOpener,
     retry_policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<ExternalBrowserAuthResult, ExternalBrowserError> {
     let budget = Duration::from_secs(authentication_timeout_secs);
     let start = Instant::now();
@@ -154,7 +155,8 @@ pub(crate) async fn external_browser_authenticate(
     tracing::debug!(port = local_port, "Local callback listener bound");
 
     let idp_data =
-        request_authenticator(client, login_parameters, username, local_port, retry_policy).await?;
+        request_authenticator(client, login_parameters, username, local_port, retry_policy, cancel)
+            .await?;
     let proof_key = idp_data.proof_key;
     tracing::debug!("Received SSO URL and proof key from Snowflake");
 
@@ -237,6 +239,7 @@ async fn request_authenticator(
     username: &str,
     redirect_port: u16,
     retry_policy: &RetryPolicy,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<AuthenticatorRequestData, ExternalBrowserError> {
     let mut data: AuthRequestData = super::base_auth_request_data(login_parameters);
     data.login_name = Some(username.to_string());
@@ -264,6 +267,7 @@ async fn request_authenticator(
         },
         &ctx,
         retry_policy,
+        cancel,
     )
     .await
     .context(RetryExhaustedSnafu)?;

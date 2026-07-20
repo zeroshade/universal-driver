@@ -2388,9 +2388,10 @@ fn execute_get_objects_and_flatten(
                 cancel.clone(),
             )
             .await
-        })?;
-        // Release is best-effort and must not reuse a possibly-cancelled token,
-        // or a cancelled operation would skip cleanup and leak the result set.
+        });
+        // Release before propagating any error so a failed/cancelled stream fetch
+        // does not leak the result set. Release is best-effort and must not reuse a
+        // possibly-cancelled token, or cancellation would skip cleanup.
         let _ = rt.block_on(async |c| {
             c.result_set_release(
                 ResultSetReleaseRequest {
@@ -2400,7 +2401,7 @@ fn execute_get_objects_and_flatten(
             )
             .await
         });
-        stream_resp
+        stream_resp?
             .stream
             .ok_or_else(|| crate::api::error::OdbcError::InternalError {
                 message: "ConnectionGetObjects: missing stream".to_string(),
@@ -2479,9 +2480,10 @@ fn execute_get_columns_and_flatten(
                 cancel.clone(),
             )
             .await
-        })?;
-        // Release is best-effort and must not reuse a possibly-cancelled token,
-        // or a cancelled operation would skip cleanup and leak the result set.
+        });
+        // Release before propagating any error so a failed/cancelled stream fetch
+        // does not leak the result set. Release is best-effort and must not reuse a
+        // possibly-cancelled token, or cancellation would skip cleanup.
         let _ = rt.block_on(async |c| {
             c.result_set_release(
                 ResultSetReleaseRequest {
@@ -2491,7 +2493,7 @@ fn execute_get_columns_and_flatten(
             )
             .await
         });
-        stream_resp
+        stream_resp?
             .stream
             .ok_or_else(|| crate::api::error::OdbcError::InternalError {
                 message: "ConnectionGetObjects: missing stream".to_string(),
