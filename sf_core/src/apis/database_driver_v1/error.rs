@@ -222,6 +222,7 @@ impl ApiError {
                 source.is_cancelled()
             }
             ApiError::QueryResponseProcess { source, .. } => source.is_cancelled(),
+            ApiError::StageBinding { source, .. } => source.is_cancelled(),
             _ => false,
         }
     }

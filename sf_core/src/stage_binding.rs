@@ -113,6 +113,17 @@ pub enum StageBindingError {
     },
 }
 
+impl StageBindingError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        match self {
+            StageBindingError::CreateStage { source, .. }
+            | StageBindingError::PutQuery { source, .. } => source.is_cancelled(),
+            StageBindingError::Upload { source, .. } => source.is_cancelled(),
+            _ => false,
+        }
+    }
+}
+
 pub struct StageBindingContext<'a> {
     pub client: &'a reqwest::Client,
     pub query_parameters: &'a QueryParameters,
@@ -181,9 +192,12 @@ async fn ensure_stage(
             Ok(())
         }
         Err(e) => {
-            flags
-                .stage_state
-                .store(StageState::Disabled, Ordering::Relaxed);
+            let next_state = if e.is_cancelled() {
+                StageState::Unknown
+            } else {
+                StageState::Disabled
+            };
+            flags.stage_state.store(next_state, Ordering::Relaxed);
             Err(e).context(CreateStageSnafu)
         }
     }
