@@ -238,8 +238,12 @@ pub(super) async fn send_logout_request(
         })
         .await;
 
-    // Remap ApiError::Query (from RefreshContext) to ApiError::Logout
+    // Remap ApiError::Query (from RefreshContext) to ApiError::Logout, but
+    // preserve cancellation classification: a cancelled logout must surface as
+    // ApiError::Cancelled rather than being flattened into ApiError::Logout
+    // (which maps to InternalError).
     result.map_err(|e| match e {
+        e if e.is_cancelled() => CancelledSnafu.build(),
         ApiError::Query { source, .. } => LogoutSnafu {
             message: format!("{source}"),
         }

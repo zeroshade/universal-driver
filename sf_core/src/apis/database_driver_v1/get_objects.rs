@@ -646,6 +646,9 @@ async fn execute_show(
         super::query::read_batches(&rowset_data, http_client, &prefetch_config, None, cancel)
             .await
             .map_err(|e| {
+                if e.is_cancelled() {
+                    return CancelledSnafu.build();
+                }
                 InvalidArgumentSnafu {
                     argument: format!("SHOW result read failed: {e}"),
                 }
