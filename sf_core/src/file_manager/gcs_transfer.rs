@@ -98,7 +98,9 @@ pub async fn upload_to_gcs_or_skip(
                 let (url, token) = resolve_url_and_token(&stage_info, &key, None)
                     .map_err(map_gcs_request_error_for_attempt)?;
 
-                let head = check_file_exists_gcs(&client, &url, token).await;
+                let head = check_file_exists_gcs(&client, &url, token, &attempt_cancel)
+                    .await
+                    .map_err(map_gcs_request_error_for_attempt)?;
 
                 if !overwrite && matches!(head, GcsHeadResult::Found { .. }) {
                     tracing::info!("File already exists in GCS: {key}");
@@ -498,7 +500,7 @@ enum GcsHeadResult {
 /// Issue a HEAD against the GCS object and return `Found { digest }` on
 /// 200, or `NotFound` otherwise.
 ///
-/// Any non-200 status (including 403 / unexpected codes) and any
+/// Any non-200 status (including 403 / unexpected codes) and any non-cancel
 /// transport-level error are treated as `NotFound` — the caller falls
 /// through to a PUT. A malformed sfc-digest header yields
 /// `Found { digest: None }`; the digest comparison then misses and the
@@ -507,13 +509,20 @@ async fn check_file_exists_gcs(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
-) -> GcsHeadResult {
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<GcsHeadResult, GcsRequestError> {
     let mut request = client.head(url);
     if let Some(t) = token {
         request = request.bearer_auth(t);
     }
 
-    match request.send().await {
+    let send_result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(GcsRequestError::Cancelled),
+        result = request.send() => result,
+    };
+
+    let head = match send_result {
         Ok(resp) => match resp.status() {
             StatusCode::OK => {
                 let digest = match try_get_header(resp.headers(), GCS_META_SFC_DIGEST) {
@@ -552,7 +561,8 @@ async fn check_file_exists_gcs(
             );
             GcsHeadResult::NotFound
         }
-    }
+    };
+    Ok(head)
 }
 
 /// Upload data to GCS with retry logic.
@@ -2188,7 +2198,10 @@ mod tests {
 
         let client = create_gcs_client(&make_stage_for_mock(&server.uri())).unwrap();
         let url = format!("{}/my-bucket/prefix/file.csv", server.uri());
-        let result = check_file_exists_gcs(&client, &url, Some("token")).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = check_file_exists_gcs(&client, &url, Some("token"), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(
             result,
@@ -2209,7 +2222,10 @@ mod tests {
 
         let client = create_gcs_client(&make_stage_for_mock(&server.uri())).unwrap();
         let url = format!("{}/my-bucket/prefix/file.csv", server.uri());
-        let result = check_file_exists_gcs(&client, &url, Some("token")).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = check_file_exists_gcs(&client, &url, Some("token"), &cancel)
+            .await
+            .unwrap();
 
         // Older objects (pre-`sfc-digest`-write era, libsfclient-S3-style
         // uploads, etc.) lack the header; the conservative fall-through
@@ -2231,7 +2247,10 @@ mod tests {
 
         let client = create_gcs_client(&make_stage_for_mock(&server.uri())).unwrap();
         let url = format!("{}/my-bucket/prefix/file.csv", server.uri());
-        let result = check_file_exists_gcs(&client, &url, Some("token")).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = check_file_exists_gcs(&client, &url, Some("token"), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(result, GcsHeadResult::NotFound);
     }
@@ -2247,7 +2266,10 @@ mod tests {
 
         let client = create_gcs_client(&make_stage_for_mock(&server.uri())).unwrap();
         let url = format!("{}/my-bucket/prefix/file.csv", server.uri());
-        let result = check_file_exists_gcs(&client, &url, Some("token")).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = check_file_exists_gcs(&client, &url, Some("token"), &cancel)
+            .await
+            .unwrap();
 
         // 403 indicates limited credentials (e.g. PUT-only); proceed
         // with upload rather than surface a hard error — the worst
@@ -2266,7 +2288,10 @@ mod tests {
 
         let client = create_gcs_client(&make_stage_for_mock(&server.uri())).unwrap();
         let url = format!("{}/my-bucket/prefix/file.csv", server.uri());
-        let result = check_file_exists_gcs(&client, &url, Some("token")).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = check_file_exists_gcs(&client, &url, Some("token"), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(result, GcsHeadResult::NotFound);
     }
@@ -2289,7 +2314,10 @@ mod tests {
 
         let client = create_gcs_client(&make_stage_for_mock(&server.uri())).unwrap();
         let url = format!("{}/my-bucket/prefix/file.csv", server.uri());
-        let result = check_file_exists_gcs(&client, &url, Some("token")).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = check_file_exists_gcs(&client, &url, Some("token"), &cancel)
+            .await
+            .unwrap();
 
         assert_eq!(result, GcsHeadResult::Found { digest: None });
     }

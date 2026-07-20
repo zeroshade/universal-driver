@@ -169,7 +169,7 @@ fn exec_direct_impl(statement_handle: sql::Handle, statement_text: &str) -> Odbc
         let multi_statement_count = inner.multi_statement_count;
         let async_enabled = inner.async_enabled;
 
-        match run_cancellable(&guard, async_enabled, |client| async move {
+        match run_cancellable(&guard, async_enabled, |client, cancel| async move {
             let _bindings_owner = bindings_owner;
             if multi_statement_count >= 0 {
                 let mut options = std::collections::HashMap::new();
@@ -187,7 +187,7 @@ fn exec_direct_impl(statement_handle: sql::Handle, statement_text: &str) -> Odbc
                             stmt_handle: Some(stmt_handle),
                             options,
                         },
-                        tokio_util::sync::CancellationToken::new(),
+                        cancel.clone(),
                     )
                     .await?;
             }
@@ -198,7 +198,7 @@ fn exec_direct_impl(statement_handle: sql::Handle, statement_text: &str) -> Odbc
                         stmt_handle: Some(stmt_handle),
                         query: effective_query,
                     },
-                    tokio_util::sync::CancellationToken::new(),
+                    cancel.clone(),
                 )
                 .await?;
 
@@ -213,7 +213,7 @@ fn exec_direct_impl(statement_handle: sql::Handle, statement_text: &str) -> Odbc
                             None
                         },
                     },
-                    tokio_util::sync::CancellationToken::new(),
+                    cancel.clone(),
                 )
                 .await?;
             Ok(ExecDirectOutcome {
@@ -848,54 +848,55 @@ fn prepare_impl(statement_handle: sql::Handle, query: &str) -> OdbcResult<()> {
 
         let query_owned = query.to_string();
 
-        let execution_outcome = run_cancellable(&guard, async_enabled, |client| async move {
-            client
-                .statement_set_sql_query(
-                    StatementSetSqlQueryRequest {
-                        stmt_handle: Some(stmt_handle),
-                        query: query_owned,
-                    },
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .await?;
+        let execution_outcome =
+            run_cancellable(&guard, async_enabled, |client, cancel| async move {
+                client
+                    .statement_set_sql_query(
+                        StatementSetSqlQueryRequest {
+                            stmt_handle: Some(stmt_handle),
+                            query: query_owned,
+                        },
+                        cancel.clone(),
+                    )
+                    .await?;
 
-            let prepare_response = client
-                .statement_prepare(
-                    StatementPrepareRequest {
-                        stmt_handle: Some(stmt_handle),
-                    },
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .await?;
+                let prepare_response = client
+                    .statement_prepare(
+                        StatementPrepareRequest {
+                            stmt_handle: Some(stmt_handle),
+                        },
+                        cancel.clone(),
+                    )
+                    .await?;
 
-            let result = prepare_response.result.required("Result is required")?;
-            let stream_ptr = result.stream.required("Stream is required")?;
-            let reader = reader_from_protobuf_stream(stream_ptr)?;
-            let schema = reader.schema();
+                let result = prepare_response.result.required("Result is required")?;
+                let stream_ptr = result.stream.required("Stream is required")?;
+                let reader = reader_from_protobuf_stream(stream_ptr)?;
+                let schema = reader.schema();
 
-            if result.number_of_binds < 0 {
-                tracing::warn!(
-                    "prepare: server reported negative bind count ({}), treating as 0",
-                    result.number_of_binds
-                );
-            }
-            let raw_bind_count = result.number_of_binds.max(0);
-            let param_count = u16::try_from(raw_bind_count).map_err(|_| {
-                crate::api::error::CountFieldIncorrectSnafu {
+                if result.number_of_binds < 0 {
+                    tracing::warn!(
+                        "prepare: server reported negative bind count ({}), treating as 0",
+                        result.number_of_binds
+                    );
+                }
+                let raw_bind_count = result.number_of_binds.max(0);
+                let param_count = u16::try_from(raw_bind_count).map_err(|_| {
+                    crate::api::error::CountFieldIncorrectSnafu {
                     reason: format!(
                         "server reported {raw_bind_count} parameter markers, exceeds maximum {}",
                         u16::MAX
                     ),
                 }
                 .build()
-            })?;
+                })?;
 
-            Ok(PrepareOutcome {
-                number_of_binds: param_count,
-                schema,
-                array_bind_supported: result.array_bind_supported,
-            })
-        })?;
+                Ok(PrepareOutcome {
+                    number_of_binds: param_count,
+                    schema,
+                    array_bind_supported: result.array_bind_supported,
+                })
+            })?;
         match execution_outcome {
             Execution::Completed(outcome) => outcome,
             Execution::Spawned(join_handle) => {
@@ -1062,7 +1063,7 @@ pub fn execute(statement_handle: sql::Handle) -> OdbcResult<()> {
         let multi_statement_count = inner.multi_statement_count;
         let async_enabled = inner.async_enabled;
 
-        let outcome = match run_cancellable(&guard, async_enabled, |client| async move {
+        let outcome = match run_cancellable(&guard, async_enabled, |client, cancel| async move {
             let _bindings_owner = bindings_owner;
             if multi_statement_count >= 0 {
                 let mut options = std::collections::HashMap::new();
@@ -1080,7 +1081,7 @@ pub fn execute(statement_handle: sql::Handle) -> OdbcResult<()> {
                             stmt_handle: Some(stmt_handle),
                             options,
                         },
-                        tokio_util::sync::CancellationToken::new(),
+                        cancel.clone(),
                     )
                     .await?;
             }
@@ -1095,7 +1096,7 @@ pub fn execute(statement_handle: sql::Handle) -> OdbcResult<()> {
                             None
                         },
                     },
-                    tokio_util::sync::CancellationToken::new(),
+                    cancel.clone(),
                 )
                 .await?;
             Ok(ExecuteOutcome {
@@ -3083,6 +3084,7 @@ fn run_cancellable<T, F>(
     async_enabled: bool,
     f: impl FnOnce(
         std::sync::Arc<sf_core::protobuf::apis::database_driver_v1::DatabaseDriverClient>,
+        CancellationToken,
     ) -> F,
 ) -> OdbcResult<Execution<T>>
 where
@@ -3095,7 +3097,7 @@ where
 
     if async_enabled {
         let token_clone = token.clone();
-        let future = f(client);
+        let future = f(client, token.clone());
         let join_handle = g.spawn(async move {
             tokio::select! {
                 biased;
@@ -3108,7 +3110,7 @@ where
     }
 
     let _cancel_guard = CancelTokenGuard::arm(&stmt.cancel_token, token.clone());
-    let future = f(client);
+    let future = f(client, token.clone());
     let result = g.block_on(async move |_c| {
         tokio::select! {
             biased;
@@ -3256,6 +3258,7 @@ fn execute_dae(
         Ok(globals) => globals,
     };
     let response = globals.block_on(async |c| {
+        let rpc_token = token.clone();
         tokio::select! {
             biased;
             _ = token.cancelled() => OperationCanceledSnafu.fail(),
@@ -3264,7 +3267,7 @@ fn execute_dae(
                     c.statement_set_sql_query(StatementSetSqlQueryRequest {
                         stmt_handle: Some(stmt_handle),
                         query,
-                    }, tokio_util::sync::CancellationToken::new())
+                    }, rpc_token.clone())
                     .await?;
                 }
                 c.statement_execute_query(StatementExecuteQueryRequest {
@@ -3275,7 +3278,7 @@ fn execute_dae(
                     } else {
                         None
                     },
-                }, tokio_util::sync::CancellationToken::new())
+                }, rpc_token.clone())
                 .await
             } => result.map_err(Into::into),
         }
