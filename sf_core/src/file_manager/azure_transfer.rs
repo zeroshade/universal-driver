@@ -444,6 +444,10 @@ impl UploadRetryAdapter for AzureUploadRetry {
         }
         .build()
     }
+
+    fn on_cancelled(&self) -> AzureUploadError {
+        azure_upload_error::CancelledSnafu.build()
+    }
 }
 
 /// Executes an Azure upload with retry, accepting a **fallible** request-builder closure.
@@ -457,12 +461,12 @@ impl UploadRetryAdapter for AzureUploadRetry {
 async fn azure_upload_with_retry<F>(
     build_request: F,
     policy: &RetryPolicy,
-    _cancel: tokio_util::sync::CancellationToken,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), AzureUploadError>
 where
     F: AsyncFn() -> Result<reqwest::RequestBuilder, AzureUploadError>,
 {
-    cloud_http::upload_with_retry(policy, &AzureUploadRetry, build_request).await
+    cloud_http::upload_with_retry(policy, &AzureUploadRetry, build_request, cancel).await
 }
 
 fn map_http_error(e: HttpError) -> AzureRequestError {

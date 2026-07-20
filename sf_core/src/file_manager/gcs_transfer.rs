@@ -775,6 +775,10 @@ impl UploadRetryAdapter for GcsUploadRetry {
             detail: format!("GCS upload {detail}"),
         }
     }
+
+    fn on_cancelled(&self) -> GcsRequestError {
+        GcsRequestError::Cancelled
+    }
 }
 
 /// Executes a GCS upload with retry, accepting a **fallible** request-builder closure.
@@ -793,12 +797,12 @@ impl UploadRetryAdapter for GcsUploadRetry {
 async fn gcs_upload_with_retry<F>(
     build_request: F,
     policy: &RetryPolicy,
-    _cancel: tokio_util::sync::CancellationToken,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), GcsRequestError>
 where
     F: AsyncFn() -> Result<reqwest::RequestBuilder, GcsRequestError>,
 {
-    cloud_http::upload_with_retry(policy, &GcsUploadRetry, build_request).await
+    cloud_http::upload_with_retry(policy, &GcsUploadRetry, build_request, cancel).await
 }
 
 fn map_http_error(e: HttpError) -> GcsRequestError {

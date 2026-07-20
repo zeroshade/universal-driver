@@ -925,8 +925,6 @@ pub async fn download_single_file(
                             ) {
                                 Ok(n) => {
                                     drop(output_file);
-                                    finalize_rename(&partial_path2, &output_path2)
-                                        .context(IoSnafu)?;
                                     Ok(n)
                                 }
                                 Err(e) => {
@@ -950,8 +948,6 @@ pub async fn download_single_file(
                             match std::io::copy(&mut { reader }, &mut output_file) {
                                 Ok(n) => {
                                     drop(output_file);
-                                    finalize_rename(&partial_path2, &output_path2)
-                                        .context(IoSnafu)?;
                                     Ok(n as i64)
                                 }
                                 Err(e) => {
@@ -968,8 +964,6 @@ pub async fn download_single_file(
                             match std::io::copy(&mut { reader }, &mut output_file) {
                                 Ok(n) => {
                                     drop(output_file);
-                                    finalize_rename(&partial_path2, &output_path2)
-                                        .context(IoSnafu)?;
                                     Ok(n as i64)
                                 }
                                 Err(e) => {
@@ -994,6 +988,22 @@ pub async fn download_single_file(
                 }
                 Err(e) => return Err(e),
             };
+
+            if cancel.is_cancelled() {
+                warn_remove_partial(&partial_path);
+                return Err(GcsDownloadError::Cancelled {
+                    location: Location::new(file!(), line!(), 0),
+                })
+                .context(GcsDownloadSnafu);
+            }
+            let partial_for_rename = partial_path.clone();
+            let output_for_rename = output_path.clone();
+            tokio::task::spawn_blocking(move || {
+                finalize_rename(&partial_for_rename, &output_for_rename)
+            })
+            .await
+            .context(BlockingTaskSnafu)?
+            .context(IoSnafu)?;
 
             // Use Content-Length hint as cloud_byte_count; if absent (chunked TE),
             // fall back to the on-cloud ciphertext bytes actually pulled off the
@@ -1042,8 +1052,6 @@ pub async fn download_single_file(
                             ) {
                                 Ok(n) => {
                                     drop(output_file);
-                                    finalize_rename(&partial_path2, &output_path2)
-                                        .context(IoSnafu)?;
                                     Ok(n)
                                 }
                                 Err(e) => {
@@ -1067,8 +1075,6 @@ pub async fn download_single_file(
                             match std::io::copy(&mut { reader }, &mut output_file) {
                                 Ok(n) => {
                                     drop(output_file);
-                                    finalize_rename(&partial_path2, &output_path2)
-                                        .context(IoSnafu)?;
                                     Ok(n as i64)
                                 }
                                 Err(e) => {
@@ -1085,8 +1091,6 @@ pub async fn download_single_file(
                             match std::io::copy(&mut { reader }, &mut output_file) {
                                 Ok(n) => {
                                     drop(output_file);
-                                    finalize_rename(&partial_path2, &output_path2)
-                                        .context(IoSnafu)?;
                                     Ok(n as i64)
                                 }
                                 Err(e) => {
@@ -1111,6 +1115,22 @@ pub async fn download_single_file(
                 }
                 Err(e) => return Err(e),
             };
+
+            if cancel.is_cancelled() {
+                warn_remove_partial(&partial_path);
+                return Err(AzureDownloadError::Cancelled {
+                    location: Location::new(file!(), line!(), 0),
+                })
+                .context(AzureDownloadSnafu);
+            }
+            let partial_for_rename = partial_path.clone();
+            let output_for_rename = output_path.clone();
+            tokio::task::spawn_blocking(move || {
+                finalize_rename(&partial_for_rename, &output_for_rename)
+            })
+            .await
+            .context(BlockingTaskSnafu)?
+            .context(IoSnafu)?;
 
             let cloud_byte_count = if cloud_byte_count_hint > 0 {
                 cloud_byte_count_hint

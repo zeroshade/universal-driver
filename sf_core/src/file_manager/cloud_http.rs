@@ -321,6 +321,7 @@ pub(super) trait UploadRetryAdapter {
     fn on_http_failure(&self, status: u16, body: String) -> Self::Err;
     fn on_transport(&self, e: reqwest::Error) -> Self::Err;
     fn on_exhausted(&self, detail: String) -> Self::Err;
+    fn on_cancelled(&self) -> Self::Err;
 }
 
 /// Shared retry/backoff loop for the cloud upload paths. The async closure
@@ -335,6 +336,7 @@ pub(super) async fn upload_with_retry<F, M>(
     policy: &RetryPolicy,
     adapter: &M,
     build_request: F,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), M::Err>
 where
     F: AsyncFn() -> Result<reqwest::RequestBuilder, M::BuildErr>,
@@ -345,6 +347,9 @@ where
     let mut sleep_ms = policy.backoff.base.as_millis() as f64;
 
     for attempt in 1..=max_attempts {
+        if cancel.is_cancelled() {
+            return Err(adapter.on_cancelled());
+        }
         let remaining = if let Some(budget) = policy.max_elapsed {
             let elapsed = start.elapsed();
             if elapsed >= budget {
@@ -363,12 +368,22 @@ where
             (None, None) => Duration::from_secs(REQUEST_TIMEOUT_SECS),
         };
 
-        let req = match build_request().await {
+        let build = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(adapter.on_cancelled()),
+            b = build_request() => b,
+        };
+        let req = match build {
             Ok(r) => r.timeout(timeout),
             Err(e) => return Err(adapter.on_build_err(e)),
         };
 
-        match req.send().await {
+        let send_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(adapter.on_cancelled()),
+            r = req.send() => r,
+        };
+        match send_result {
             Ok(resp) => {
                 if resp.status().is_success() {
                     return Ok(());
@@ -379,12 +394,20 @@ where
                 let status_code = resp.status().as_u16();
                 let retryable = is_retryable_status(status_code, &policy.extra_retryable_statuses);
                 if !retryable || attempt >= max_attempts {
-                    let body = read_error_body(resp).await;
+                    let body = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(adapter.on_cancelled()),
+                        b = read_error_body(resp) => b,
+                    };
                     return Err(adapter.on_http_failure(status_code, body));
                 }
                 let delay = Duration::from_millis(sleep_ms as u64);
                 sleep_ms = next_delay_ms(sleep_ms, &policy.backoff);
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(adapter.on_cancelled()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
             Err(e) => {
                 if attempt >= max_attempts {
@@ -392,7 +415,11 @@ where
                 }
                 let delay = Duration::from_millis(sleep_ms as u64);
                 sleep_ms = next_delay_ms(sleep_ms, &policy.backoff);
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(adapter.on_cancelled()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
         }
     }
