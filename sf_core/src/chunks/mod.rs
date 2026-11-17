@@ -306,6 +306,7 @@ async fn get_initial_chunk_reader(
         let first = chunk_download_data
             .pop_front()
             .context(MissingInitialChunkSnafu)?;
+        let expected_rows = first.row_count;
         let bytes = get_chunk_data(client.clone(), first, read_timeout).await?;
         match remote_format {
             ChunkFormatKind::ArrowIpc => {
@@ -318,10 +319,12 @@ async fn get_initial_chunk_reader(
                 let parser = JsonChunkParser {
                     row_types: row_types.to_vec(),
                 };
-                let batches = tokio::task::spawn_blocking(move || parser.parse_chunk(bytes))
-                    .await
-                    .context(SpawnBlockingSnafu)?
-                    .context(ChunkReadSnafu)?;
+                let batches = tokio::task::spawn_blocking(move || {
+                    parser.parse_chunk_with_row_count(bytes, expected_rows)
+                })
+                .await
+                .context(SpawnBlockingSnafu)?
+                .context(ChunkReadSnafu)?;
                 let schema = batches
                     .first()
                     .map(RecordBatch::schema)

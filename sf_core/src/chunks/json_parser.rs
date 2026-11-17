@@ -89,6 +89,21 @@ impl ParseChunk for JsonChunkParser {
 
         builders_to_batches(builders, &self.row_types)
     }
+
+    fn parse_chunk_with_row_count(
+        &self,
+        data: Vec<u8>,
+        expected_rows: i32,
+    ) -> Result<Vec<RecordBatch>, ArrowError> {
+        let batches = self.parse_chunk(data)?;
+        let actual_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        if usize::try_from(expected_rows).ok() != Some(actual_rows) {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Malformed JSON chunk: expected {expected_rows} rows but got {actual_rows}",
+            )));
+        }
+        Ok(batches)
+    }
 }
 
 /// Scans JSON chunk bytes, dispatching each cell directly to column builders.
@@ -101,6 +116,10 @@ impl ParseChunk for JsonChunkParser {
 /// skipping brackets that appear inside JSON strings) rather than splitting on
 /// `\n`. This also tolerates the legacy newline-delimited shape.
 fn parse_json_rows(data: &[u8], builders: &mut [ColumnBuilder]) -> Result<usize, ArrowError> {
+    // Validate once per chunk; the normal UTF-8 path borrows without allocating.
+    // Both row scanners then see the same replacement behavior for invalid input.
+    let data = String::from_utf8_lossy(data);
+    let data = data.as_bytes();
     let mut row_count: usize = 0;
 
     let mut depth: i32 = 0;
@@ -120,6 +139,12 @@ fn parse_json_rows(data: &[u8], builders: &mut [ColumnBuilder]) -> Result<usize,
             continue;
         }
 
+        if depth == 0 && b != b'[' && b != b',' && !b.is_ascii_whitespace() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Malformed JSON chunk: unexpected byte at offset {i}",
+            )));
+        }
+
         match b {
             b'"' => in_string = true,
             b'[' => {
@@ -135,14 +160,16 @@ fn parse_json_rows(data: &[u8], builders: &mut [ColumnBuilder]) -> Result<usize,
                         scan_json_row(&data[start..=i], builders)?;
                         row_count += 1;
                     }
-                } else if depth < 0 {
-                    return Err(ArrowError::InvalidArgumentError(
-                        "Malformed JSON chunk: unbalanced ']'".to_string(),
-                    ));
                 }
             }
             _ => {}
         }
+    }
+
+    if depth != 0 || in_string {
+        return Err(ArrowError::InvalidArgumentError(
+            "Malformed JSON chunk: truncated row".to_string(),
+        ));
     }
 
     Ok(row_count)
@@ -1299,6 +1326,77 @@ mod tests {
         parser
             .parse_chunk(data.to_vec())
             .expect("parse_chunk failed")
+    }
+
+    #[test]
+    fn downloaded_row_count_must_match() {
+        let parser = JsonChunkParser {
+            row_types: vec![RowType::text("t", true, 64, 256)],
+        };
+        for expected_rows in [0, 1, 3] {
+            let err = parser
+                .parse_chunk_with_row_count(br#"["1"],["2"]"#.to_vec(), expected_rows)
+                .unwrap_err();
+            assert!(err.to_string().contains("rows but got 2"));
+        }
+        let batches = parser
+            .parse_chunk_with_row_count(br#"["1"],["2"]"#.to_vec(), 2)
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        let batches = parser.parse_chunk_with_row_count(vec![], 0).unwrap();
+        assert_eq!(batches[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn truncated_final_row_returns_error() {
+        let parser = JsonChunkParser {
+            row_types: vec![RowType::text("t", true, 64, 256)],
+        };
+        let err = parser.parse_chunk(br#"["1"],["2""#.to_vec()).unwrap_err();
+        assert!(err.to_string().contains("truncated row"));
+    }
+
+    #[test]
+    fn unterminated_string_returns_error() {
+        let parser = JsonChunkParser {
+            row_types: vec![RowType::text("t", true, 64, 256)],
+        };
+        for data in [br#"["1"],["2"#.as_slice(), br#"["ends with \"#.as_slice()] {
+            let err = parser.parse_chunk(data.to_vec()).unwrap_err();
+            assert!(err.to_string().contains("truncated row"));
+        }
+    }
+
+    #[test]
+    fn garbage_outside_rows_returns_error() {
+        let parser = JsonChunkParser {
+            row_types: vec![RowType::text("t", true, 64, 256)],
+        };
+        for data in [
+            br#"["1"] xyz ["2"]"#.as_slice(),
+            br#""ignored",["1"]"#.as_slice(),
+            br#"["1"] null"#.as_slice(),
+            br#"["1"]]"#.as_slice(),
+        ] {
+            assert!(parser.parse_chunk(data.to_vec()).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced() {
+        let batches = parse(
+            vec![RowType::text("t", true, 64, 256)],
+            b"[\"a\xffb\"],[\"\xc3\"],[\"valid\"]",
+        );
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.value(0), "a\u{fffd}b");
+        assert_eq!(col.value(1), "\u{fffd}");
+        assert_eq!(col.value(2), "valid");
     }
 
     #[test]
