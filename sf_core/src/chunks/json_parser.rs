@@ -155,11 +155,11 @@ fn parse_json_rows(data: &[u8], builders: &mut [ColumnBuilder]) -> Result<usize,
             }
             b']' => {
                 depth -= 1;
-                if depth == 0 {
-                    if let Some(start) = row_start.take() {
-                        scan_json_row(&data[start..=i], builders)?;
-                        row_count += 1;
-                    }
+                if depth == 0
+                    && let Some(start) = row_start.take()
+                {
+                    scan_json_row(&data[start..=i], builders)?;
+                    row_count += 1;
                 }
             }
             _ => {}

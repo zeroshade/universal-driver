@@ -60,6 +60,20 @@ pub struct StageInfoRefreshContext {
     pub sql: String,
     pub query_parameters: crate::config::rest_parameters::QueryParameters,
     pub conn: Arc<Mutex<Connection>>,
+    pub query_tag: Option<String>,
+}
+
+impl StageInfoRefreshContext {
+    pub(super) fn query_input(&self, sql: &str) -> rest::snowflake::QueryInput<'static> {
+        let mut input = rest::snowflake::QueryInput::new(sql);
+        if let Some(tag) = &self.query_tag {
+            input.query_parameters = Some(std::collections::HashMap::from([(
+                "QUERY_TAG".to_string(),
+                serde_json::Value::String(tag.clone()),
+            )]));
+        }
+        input
+    }
 }
 
 /// Executes a PUT/GET file transfer, returning the results as a `RowsetData`.
@@ -577,7 +591,7 @@ async fn fetch_fresh_stage_info_with_sql(
         )
     };
 
-    let query_input = rest::snowflake::QueryInput::new(sql.to_string());
+    let query_input = stage_refresh_ctx.query_input(sql);
     let response = refresh_ctx
         .execute_with_refresh(|session_token| {
             let http_client = http_client.clone();
@@ -1265,6 +1279,7 @@ fn stub_ctx() -> StageInfoRefreshContext {
             service_name: None,
         },
         conn: Arc::new(Mutex::new(Connection::new())),
+        query_tag: None,
     }
 }
 
@@ -1309,6 +1324,23 @@ pub(crate) fn test_counting_coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_refresh_preserves_upload_query_tag_and_rewritten_sql() {
+        let mut ctx = stub_ctx();
+        assert!(ctx.query_input(&ctx.sql).query_parameters.is_none());
+        for tag in ["ingest-tag", ""] {
+            ctx.query_tag = Some(tag.to_string());
+            for sql in [ctx.sql.as_str(), "PUT file://single-file @stage"] {
+                let input = ctx.query_input(sql);
+                assert_eq!(input.sql, sql);
+                assert_eq!(
+                    input.query_parameters.unwrap().get("QUERY_TAG"),
+                    Some(&serde_json::Value::String(tag.to_string())),
+                );
+            }
+        }
+    }
 
     #[test]
     fn upload_column_metadata_has_correct_structure_python() {

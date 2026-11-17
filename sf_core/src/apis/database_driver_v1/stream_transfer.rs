@@ -87,6 +87,7 @@ const DOWNLOAD_STREAM_MAX_CHUNK_LEN: usize = 8 * 1024 * 1024;
 pub(super) struct UploadStreamSession {
     pub conn_handle: Handle,
     pub sql: String,
+    pub query_tag: Option<String>,
     pub buffer: Mutex<SpooledBuffer>,
     /// Mem-to-file spill threshold for `buffer`. Always `SPOOL_MEM_THRESHOLD`
     /// in production; tests inject a smaller value to exercise the mem→file
@@ -146,6 +147,18 @@ impl DatabaseDriverV1 {
         conn_handle: Handle,
         sql: String,
     ) -> Result<Handle, ApiError> {
+        self.connection_upload_stream_begin_with_query_tag(conn_handle, sql, None)
+            .await
+    }
+
+    /// Begins a chunked upload with a per-upload query tag. The tag applies to
+    /// the PUT and any stage-credential refresh without changing session state.
+    pub async fn connection_upload_stream_begin_with_query_tag(
+        &self,
+        conn_handle: Handle,
+        sql: String,
+        query_tag: Option<String>,
+    ) -> Result<Handle, ApiError> {
         self.connections
             .get_obj(conn_handle)
             .context(InvalidArgumentSnafu {
@@ -162,6 +175,7 @@ impl DatabaseDriverV1 {
         let session = UploadStreamSession {
             conn_handle,
             sql,
+            query_tag,
             buffer: Mutex::new(SpooledBuffer::default()),
             spill_threshold: SPOOL_MEM_THRESHOLD,
         };
@@ -224,7 +238,12 @@ impl DatabaseDriverV1 {
         // Must outlive the upload below: it unlinks the spooled temp file on
         // drop, and the upload streams the PUT body from its path.
         let result = self
-            .run_put_stream_via_gs(session.conn_handle, session.sql.clone(), source)
+            .run_put_stream_via_gs(
+                session.conn_handle,
+                session.sql.clone(),
+                source,
+                session.query_tag.clone(),
+            )
             .await;
         drop(temp_path_guard);
         result
@@ -256,6 +275,7 @@ impl DatabaseDriverV1 {
         conn_handle: Handle,
         sql: String,
         source: ByteSource,
+        query_tag: Option<String>,
     ) -> Result<ResultSetInfo, ApiError> {
         let telemetry_id = self.telemetry_id_for_conn(conn_handle).await;
         async {
@@ -277,15 +297,21 @@ impl DatabaseDriverV1 {
 
             let query_transport = query_context(&conn_ptr).await?;
 
-            let response = run_sql_against_gs(&conn_ptr, &query_transport, sql.clone()).await?;
-            update_caches(&conn_ptr, &sql, &response).await;
-
-            let gs_data = response.data;
             let refresh_ctx = StageInfoRefreshContext {
                 sql: sql.clone(),
                 query_parameters: query_transport.query_parameters.clone(),
                 conn: conn_ptr.clone(),
+                query_tag,
             };
+            let response = run_sql_against_gs(
+                &conn_ptr,
+                &query_transport,
+                refresh_ctx.query_input(&sql),
+            )
+            .await?;
+            update_caches(&conn_ptr, &sql, &response).await;
+
+            let gs_data = response.data;
             let use_s3_regional_url = conn_ptr
                 .lock()
                 .await
@@ -387,7 +413,9 @@ impl DatabaseDriverV1 {
 
             let query_transport = query_context(&conn_ptr).await?;
 
-            let response = run_sql_against_gs(&conn_ptr, &query_transport, get_sql.clone()).await?;
+            let response =
+                run_sql_against_gs(&conn_ptr, &query_transport, QueryInput::new(get_sql.clone()))
+                    .await?;
             update_caches(&conn_ptr, &get_sql, &response).await;
 
             let (use_s3_regional_url, unsafe_file_write, transport) = {
@@ -418,6 +446,7 @@ impl DatabaseDriverV1 {
                 sql: get_sql,
                 query_parameters: query_transport.query_parameters,
                 conn: conn_ptr.clone(),
+                query_tag: None,
             };
             let refresher = stream_stage_info_refresher(refresh_ctx, resolved.initial_snapshot);
 
@@ -595,13 +624,13 @@ impl DatabaseDriverV1 {
 async fn run_sql_against_gs(
     conn_ptr: &Arc<Mutex<Connection>>,
     transport: &QueryTransport,
-    sql: String,
+    query_input: QueryInput<'_>,
 ) -> Result<query_response::Response, ApiError> {
     submit_query(
         None,
         conn_ptr,
         transport,
-        QueryInput::new(sql),
+        query_input,
         QueryExecutionMode::Blocking,
         uuid::Uuid::new_v4(),
         None,
@@ -1012,6 +1041,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_stream_preserves_query_tag_until_finish() {
+        let driver = DatabaseDriverV1::new();
+        let conn_handle = register_bare_connection(&driver);
+        for query_tag in [None, Some(String::new()), Some("ingest-tag".to_string())] {
+            let upload_handle = driver
+                .connection_upload_stream_begin_with_query_tag(
+                    conn_handle,
+                    "PUT file://x @s".into(),
+                    query_tag.clone(),
+                )
+                .await
+                .unwrap();
+            let session = driver.upload_streams.get_obj(upload_handle).unwrap();
+            assert_eq!(session.query_tag, query_tag);
+            driver
+                .connection_upload_stream_abort(upload_handle)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn upload_stream_chunk_rejects_unknown_handle() {
         let driver = DatabaseDriverV1::new();
         let result = driver
@@ -1054,6 +1105,7 @@ mod tests {
         let upload_handle = driver.upload_streams.add_handle(UploadStreamSession {
             conn_handle,
             sql: "PUT file://x @s".into(),
+            query_tag: None,
             buffer: Mutex::new(SpooledBuffer::default()),
             spill_threshold: 16,
         });
